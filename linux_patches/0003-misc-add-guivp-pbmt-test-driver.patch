@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 2 Apr 2026 14:00:00 +0800
+Subject: [PATCH] misc: add GUI-VP PBMT test driver
+
+Add a small misc driver that uses the GUI-VP cache-ace reserved-memory
+window to validate Svpbmt mappings from Linux. The first half is exposed
+as an IO mapping and the second half as an NC mapping. A boot-time
+self-test makes it easy to observe both cases without userspace.
+---
+ drivers/misc/Makefile          |  1 +
+ drivers/misc/guivp_pbmt_test.c | 190 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 191 insertions(+)
+ create mode 100644 drivers/misc/guivp_pbmt_test.c
+
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 95c66b5ce1ef..7b3419626c4d 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -73,4 +73,5 @@ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
+ obj-$(CONFIG_NSM)		+= nsm.o
+ obj-$(CONFIG_MARVELL_CN10K_DPI)	+= mrvl_cn10k_dpi.o
+ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
++obj-y				+= guivp_pbmt_test.o
+ obj-y				+= keba/
+diff --git a/drivers/misc/guivp_pbmt_test.c b/drivers/misc/guivp_pbmt_test.c
+new file mode 100644
+index 000000000000..6cb8454024a1
+--- /dev/null
++++ b/drivers/misc/guivp_pbmt_test.c
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GUI-VP PBMT test device
++ *
++ * The cache-ace reserved-memory window is split into two halves:
++ *  - first half: IO mapping
++ *  - second half: NC mapping
++ *
++ * The driver exposes /dev/guivp_pbmt_test for mmap-based validation and
++ * performs a small boot-time self-test so VP-side traces can be observed
++ * without requiring a userspace helper.
++ */
++
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/types.h>
++
++#define GUIVP_PBMT_TEST_NAME "guivp_pbmt_test"
++#define GUIVP_CACHE_ACE_RMEM_PATH "/reserved-memory/cache-ace@f0000000"
++
++struct guivp_pbmt_test_ctx {
++	struct miscdevice miscdev;
++	phys_addr_t base;
++	phys_addr_t size;
++	phys_addr_t half_size;
++};
++
++static struct guivp_pbmt_test_ctx guivp_pbmt_ctx;
++
++static const char *guivp_pbmt_region_name(loff_t offset, const struct guivp_pbmt_test_ctx *ctx)
++{
++	return offset < ctx->half_size ? "IO" : "NC";
++}
++
++static pgprot_t guivp_pbmt_region_pgprot(loff_t offset, pgprot_t prot, const struct guivp_pbmt_test_ctx *ctx)
++{
++	if (offset < ctx->half_size)
++		return pgprot_noncached(prot);
++
++	return pgprot_writecombine(prot);
++}
++
++static int guivp_pbmt_selftest_mapping(phys_addr_t phys, pgprot_t prot, const char *name)
++{
++	void __iomem *addr;
++	u64 write_val;
++	u64 read_val;
++
++	write_val = phys ^ 0x5a5aa5a50f0f9696ULL;
++	read_val = 0;
++
++	addr = ioremap_prot(phys, sizeof(write_val), prot);
++	if (!addr)
++		return -ENOMEM;
++
++	memcpy_toio(addr, &write_val, sizeof(write_val));
++	memcpy_fromio(&read_val, addr, sizeof(read_val));
++
++	pr_info("%s: selftest %s phys=%pa wrote=0x%016llx read=0x%016llx\n",
++		GUIVP_PBMT_TEST_NAME, name, &phys, write_val, read_val);
++
++	iounmap(addr);
++	return 0;
++}
++
++static int guivp_pbmt_run_selftest(const struct guivp_pbmt_test_ctx *ctx)
++{
++	int ret;
++	phys_addr_t io_phys;
++	phys_addr_t nc_phys;
++
++	io_phys = ctx->base;
++	nc_phys = ctx->base + ctx->half_size;
++
++	ret = guivp_pbmt_selftest_mapping(io_phys, pgprot_noncached(PAGE_KERNEL), "IO");
++	if (ret)
++		return ret;
++
++	return guivp_pbmt_selftest_mapping(nc_phys, pgprot_writecombine(PAGE_KERNEL), "NC");
++}
++
++static int guivp_pbmt_open(struct inode *inode, struct file *file)
++{
++	file->private_data = &guivp_pbmt_ctx;
++	return 0;
++}
++
++static int guivp_pbmt_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	struct guivp_pbmt_test_ctx *ctx = file->private_data;
++	const unsigned long size = vma->vm_end - vma->vm_start;
++	const loff_t offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
++	const loff_t end = offset + size;
++	const phys_addr_t phys = ctx->base + offset;
++	pgprot_t prot;
++
++	if (!ctx || !size)
++		return -EINVAL;
++
++	if (offset < 0 || end > ctx->size)
++		return -EINVAL;
++
++	if ((offset < ctx->half_size && end > ctx->half_size) || (offset >= ctx->half_size && end > ctx->size))
++		return -EINVAL;
++
++	prot = guivp_pbmt_region_pgprot(offset, vma->vm_page_prot, ctx);
++	vma->vm_page_prot = prot;
++	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++
++	pr_info("%s: mmap region=%s phys=0x%llx size=0x%lx pgoff=0x%llx\n",
++		GUIVP_PBMT_TEST_NAME, guivp_pbmt_region_name(offset, ctx),
++		(unsigned long long)phys, size, (unsigned long long)offset);
++
++	return remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT, size, prot);
++}
++
++static const struct file_operations guivp_pbmt_fops = {
++	.owner = THIS_MODULE,
++	.open = guivp_pbmt_open,
++	.mmap = guivp_pbmt_mmap,
++	.llseek = noop_llseek,
++};
++
++static int __init guivp_pbmt_init(void)
++{
++	struct device_node *np;
++	struct reserved_mem *rmem;
++	int ret;
++
++	np = of_find_node_by_path(GUIVP_CACHE_ACE_RMEM_PATH);
++	if (!np) {
++		pr_info("%s: reserved-memory node %s not found, skipping\n",
++			GUIVP_PBMT_TEST_NAME, GUIVP_CACHE_ACE_RMEM_PATH);
++		return 0;
++	}
++
++	rmem = of_reserved_mem_lookup(np);
++	of_node_put(np);
++	if (!rmem) {
++		pr_info("%s: reserved-memory lookup failed, skipping\n", GUIVP_PBMT_TEST_NAME);
++		return 0;
++	}
++
++	if (rmem->size < (2 * PAGE_SIZE)) {
++		pr_err("%s: reserved-memory window too small: %pa bytes\n",
++		       GUIVP_PBMT_TEST_NAME, &rmem->size);
++		return -EINVAL;
++	}
++
++	guivp_pbmt_ctx.base = rmem->base;
++	guivp_pbmt_ctx.size = rmem->size;
++	guivp_pbmt_ctx.half_size = round_down(rmem->size / 2, PAGE_SIZE);
++	if (!guivp_pbmt_ctx.half_size) {
++		pr_err("%s: invalid half_size derived from %pa\n",
++		       GUIVP_PBMT_TEST_NAME, &rmem->size);
++		return -EINVAL;
++	}
++
++	guivp_pbmt_ctx.miscdev.minor = MISC_DYNAMIC_MINOR;
++	guivp_pbmt_ctx.miscdev.name = GUIVP_PBMT_TEST_NAME;
++	guivp_pbmt_ctx.miscdev.fops = &guivp_pbmt_fops;
++	guivp_pbmt_ctx.miscdev.mode = 0600;
++
++	pr_info("%s: reserved window base=%pa size=%pa half=%pa\n",
++		GUIVP_PBMT_TEST_NAME,
++		&guivp_pbmt_ctx.base,
++		&guivp_pbmt_ctx.size,
++		&guivp_pbmt_ctx.half_size);
++
++	ret = misc_register(&guivp_pbmt_ctx.miscdev);
++	if (ret) {
++		pr_err("%s: misc_register failed: %d\n", GUIVP_PBMT_TEST_NAME, ret);
++		return ret;
++	}
++
++	ret = guivp_pbmt_run_selftest(&guivp_pbmt_ctx);
++	if (ret)
++		pr_err("%s: selftest failed: %d\n", GUIVP_PBMT_TEST_NAME, ret);
++
++	return 0;
++}
++
++static void __exit guivp_pbmt_exit(void)
++{
++	misc_deregister(&guivp_pbmt_ctx.miscdev);
++}
++
++module_init(guivp_pbmt_init);
++module_exit(guivp_pbmt_exit);
++
++MODULE_DESCRIPTION("GUI-VP PBMT test misc device");
++MODULE_LICENSE("GPL");
+-- 
+2.43.0
