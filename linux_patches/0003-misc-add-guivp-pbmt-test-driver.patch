@@ -34,8 +34,8 @@ index 000000000000..6cb8454024a1
 + * GUI-VP PBMT test device
 + *
 + * The cache-ace reserved-memory window is split into two halves:
-+ *  - first half: IO mapping
-+ *  - second half: NC mapping
++ *  - first half: coherent main-memory mapping
++ *  - second half: coherent main-memory mapping
 + *
 + * The driver exposes /dev/guivp_pbmt_test for mmap-based validation and
 + * performs a small boot-time self-test so VP-side traces can be observed
@@ -66,15 +66,12 @@ index 000000000000..6cb8454024a1
 +
 +static const char *guivp_pbmt_region_name(loff_t offset, const struct guivp_pbmt_test_ctx *ctx)
 +{
-+	return offset < ctx->half_size ? "IO" : "NC";
++	return offset < ctx->half_size ? "MEM0" : "MEM1";
 +}
 +
 +static pgprot_t guivp_pbmt_region_pgprot(loff_t offset, pgprot_t prot, const struct guivp_pbmt_test_ctx *ctx)
 +{
-+	if (offset < ctx->half_size)
-+		return pgprot_noncached(prot);
-+
-+	return pgprot_writecombine(prot);
++	return prot;
 +}
 +
 +static int guivp_pbmt_selftest_mapping(phys_addr_t phys, pgprot_t prot, const char *name)
@@ -103,17 +100,17 @@ index 000000000000..6cb8454024a1
 +static int guivp_pbmt_run_selftest(const struct guivp_pbmt_test_ctx *ctx)
 +{
 +	int ret;
-+	phys_addr_t io_phys;
-+	phys_addr_t nc_phys;
++	phys_addr_t mem0_phys;
++	phys_addr_t mem1_phys;
 +
-+	io_phys = ctx->base;
-+	nc_phys = ctx->base + ctx->half_size;
++	mem0_phys = ctx->base;
++	mem1_phys = ctx->base + ctx->half_size;
 +
-+	ret = guivp_pbmt_selftest_mapping(io_phys, pgprot_noncached(PAGE_KERNEL), "IO");
++	ret = guivp_pbmt_selftest_mapping(mem0_phys, PAGE_KERNEL, "MEM0");
 +	if (ret)
 +		return ret;
 +
-+	return guivp_pbmt_selftest_mapping(nc_phys, pgprot_writecombine(PAGE_KERNEL), "NC");
++	return guivp_pbmt_selftest_mapping(mem1_phys, PAGE_KERNEL, "MEM1");
 +}
 +
 +static int guivp_pbmt_open(struct inode *inode, struct file *file)
