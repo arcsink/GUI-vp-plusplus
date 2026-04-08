@@ -9,8 +9,8 @@ three regions using PMA, NC, and IO mappings. A boot-time self-test makes
 it easy to observe all cases without userspace.
 ---
  drivers/misc/Makefile          |  1 +
- drivers/misc/guivp_pbmt_test.c | 289 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 290 insertions(+)
+ drivers/misc/guivp_pbmt_test.c | 366 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 367 insertions(+)
  create mode 100644 drivers/misc/guivp_pbmt_test.c
 
 diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
@@ -28,7 +28,7 @@ new file mode 100644
 index 000000000000..6cb8454024a1
 --- /dev/null
 +++ b/drivers/misc/guivp_pbmt_test.c
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,366 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * GUI-VP PBMT test device
@@ -53,10 +53,12 @@ index 000000000000..6cb8454024a1
 +#include <linux/of_reserved_mem.h>
 +#include <linux/types.h>
 +#include <linux/uaccess.h>
++#include <asm/asm-extable.h>
 +
 +#define GUIVP_PBMT_TEST_NAME "guivp_pbmt_test"
 +#define GUIVP_CACHE_ACE_RMEM_PATH "/reserved-memory/cache-ace@e0000000"
 +#define GUIVP_REGION_PMA_OFFSET 0x00000000ULL
++#define GUIVP_REGION_PMA_AMO_OFFSET 0x0fffe000ULL
 +#define GUIVP_REGION_PMA_FAULT_OFFSET 0x0ffff000ULL
 +#define GUIVP_REGION_NC_OFFSET 0x10000000ULL
 +#define GUIVP_REGION_IO_OFFSET 0x18000000ULL
@@ -71,6 +73,42 @@ index 000000000000..6cb8454024a1
 +static struct guivp_pbmt_test_ctx guivp_pbmt_ctx;
 +
 +static int guivp_pbmt_selftest_mapping(phys_addr_t phys, pgprot_t prot, const char *name);
++
++static int guivp_pbmt_amo_or_nofault(void __iomem *addr, u64 op, u64 *old)
++{
++	long ret = 0;
++	u64 oldval = 0;
++
++	asm volatile(
++		"1: amoor.d.aqrl %[old], %[op], %[mem]\n"
++		"2:\n"
++		_ASM_EXTABLE_UACCESS_ERR(1b, 2b, %[ret])
++		: [ret] "+r" (ret), [old] "=&r" (oldval),
++		  [mem] "+m" (*(u64 __force *)addr)
++		: [op] "r" (op)
++		: "memory");
++
++	*old = oldval;
++	return ret;
++}
++
++static int guivp_pbmt_amo_add_nofault(void __iomem *addr, u64 op, u64 *old)
++{
++	long ret = 0;
++	u64 oldval = 0;
++
++	asm volatile(
++		"1: amoadd.d.aqrl %[old], %[op], %[mem]\n"
++		"2:\n"
++		_ASM_EXTABLE_UACCESS_ERR(1b, 2b, %[ret])
++		: [ret] "+r" (ret), [old] "=&r" (oldval),
++		  [mem] "+m" (*(u64 __force *)addr)
++		: [op] "r" (op)
++		: "memory");
++
++	*old = oldval;
++	return ret;
++}
 +
 +static const char *guivp_pbmt_region_name(loff_t offset, const struct guivp_pbmt_test_ctx *ctx)
 +{
@@ -187,6 +225,39 @@ index 000000000000..6cb8454024a1
 +	return 0;
 +}
 +
++static int guivp_pbmt_selftest_pma_amo(const struct guivp_pbmt_test_ctx *ctx)
++{
++	phys_addr_t phys = ctx->base + GUIVP_REGION_PMA_AMO_OFFSET;
++	void __iomem *addr;
++	u64 init_val;
++	u64 or_old;
++	u64 add_old;
++	long or_ret;
++	long add_ret;
++
++	init_val = phys ^ 0x13572468abcdef00ULL;
++
++	addr = ioremap_prot(phys, sizeof(init_val), PAGE_KERNEL);
++	if (!addr)
++		return -ENOMEM;
++
++	memcpy_toio(addr, &init_val, sizeof(init_val));
++	or_ret = guivp_pbmt_amo_or_nofault(addr, 0x10, &or_old);
++	add_ret = guivp_pbmt_amo_add_nofault(addr, 1, &add_old);
++	iounmap(addr);
++
++	if (or_ret || !add_ret) {
++		pr_err("%s: AMO selftest PMA_AMO_LOGICAL phys=%pa unexpected amoor_ret=%ld amoadd_ret=%ld or_old=0x%016llx add_old=0x%016llx\n",
++		       GUIVP_PBMT_TEST_NAME, &phys, or_ret, add_ret,
++		       or_old, add_old);
++		return -EIO;
++	}
++
++	pr_info("%s: AMO selftest PMA_AMO_LOGICAL phys=%pa amoor_ret=%ld amoadd_ret=%ld or_old=0x%016llx PASS\n",
++		GUIVP_PBMT_TEST_NAME, &phys, or_ret, add_ret, or_old);
++	return 0;
++}
++
 +static int guivp_pbmt_run_selftest(const struct guivp_pbmt_test_ctx *ctx)
 +{
 +	int ret;
@@ -200,6 +271,10 @@ index 000000000000..6cb8454024a1
 +	}
 +
 +	ret = guivp_pbmt_selftest_pma_fault(ctx);
++	if (ret)
++		return ret;
++
++	ret = guivp_pbmt_selftest_pma_amo(ctx);
 +	if (ret)
 +		return ret;
 +
@@ -282,11 +357,13 @@ index 000000000000..6cb8454024a1
 +	guivp_pbmt_ctx.miscdev.fops = &guivp_pbmt_fops;
 +	guivp_pbmt_ctx.miscdev.mode = 0600;
 +
-+	pr_info("%s: reserved window base=%pa size=%pa PMA=%#llx-%#llx PMA_DENY=%#llx-%#llx NC=%#llx-%#llx IO=%#llx-%#llx\n",
++	pr_info("%s: reserved window base=%pa size=%pa PMA=%#llx-%#llx PMA_AMO_LOGICAL=%#llx-%#llx PMA_DENY=%#llx-%#llx NC=%#llx-%#llx IO=%#llx-%#llx\n",
 +		GUIVP_PBMT_TEST_NAME,
 +		&guivp_pbmt_ctx.base,
 +		&guivp_pbmt_ctx.size,
 +		(unsigned long long)GUIVP_REGION_PMA_OFFSET,
++		(unsigned long long)(GUIVP_REGION_PMA_AMO_OFFSET - 1),
++		(unsigned long long)GUIVP_REGION_PMA_AMO_OFFSET,
 +		(unsigned long long)(GUIVP_REGION_PMA_FAULT_OFFSET - 1),
 +		(unsigned long long)GUIVP_REGION_PMA_FAULT_OFFSET,
 +		(unsigned long long)(GUIVP_REGION_NC_OFFSET - 1),
@@ -318,5 +395,5 @@ index 000000000000..6cb8454024a1
 +
 +MODULE_DESCRIPTION("GUI-VP PBMT test misc device");
 +MODULE_LICENSE("GPL");
--- 
+--
 2.43.0
