@@ -4,13 +4,13 @@ Date: Thu, 2 Apr 2026 14:00:00 +0800
 Subject: [PATCH] misc: add GUI-VP PBMT test driver
 
 Add a small misc driver that uses the GUI-VP cache-ace reserved-memory
-window to validate Svpbmt mappings from Linux. The first half is exposed
-as an IO mapping and the second half as an NC mapping. A boot-time
-self-test makes it easy to observe both cases without userspace.
+window to validate Svpbmt mappings from Linux. The window is split into
+three regions using PMA, NC, and IO mappings. A boot-time self-test makes
+it easy to observe all cases without userspace.
 ---
  drivers/misc/Makefile          |  1 +
- drivers/misc/guivp_pbmt_test.c | 190 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 191 insertions(+)
+ drivers/misc/guivp_pbmt_test.c | 250 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 251 insertions(+)
  create mode 100644 drivers/misc/guivp_pbmt_test.c
 
 diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
@@ -28,14 +28,15 @@ new file mode 100644
 index 000000000000..6cb8454024a1
 --- /dev/null
 +++ b/drivers/misc/guivp_pbmt_test.c
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,250 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * GUI-VP PBMT test device
 + *
-+ * The cache-ace reserved-memory window is split into two halves:
-+ *  - first half: coherent main-memory mapping
-+ *  - second half: coherent main-memory mapping
++ * The cache-ace reserved-memory window is split into three fixed regions:
++ *  - 0xE0000000-0xEFFFFFFF: PMA mapping
++ *  - 0xF0000000-0xF7FFFFFF: NC mapping
++ *  - 0xF8000000-0xFFFFFFFF: IO mapping
 + *
 + * The driver exposes /dev/guivp_pbmt_test for mmap-based validation and
 + * performs a small boot-time self-test so VP-side traces can be observed
@@ -53,25 +54,81 @@ index 000000000000..6cb8454024a1
 +#include <linux/types.h>
 +
 +#define GUIVP_PBMT_TEST_NAME "guivp_pbmt_test"
-+#define GUIVP_CACHE_ACE_RMEM_PATH "/reserved-memory/cache-ace@f0000000"
++#define GUIVP_CACHE_ACE_RMEM_PATH "/reserved-memory/cache-ace@e0000000"
++#define GUIVP_REGION_PMA_OFFSET 0x00000000ULL
++#define GUIVP_REGION_NC_OFFSET 0x10000000ULL
++#define GUIVP_REGION_IO_OFFSET 0x18000000ULL
++#define GUIVP_REGION_END_OFFSET 0x20000000ULL
 +
 +struct guivp_pbmt_test_ctx {
 +	struct miscdevice miscdev;
 +	phys_addr_t base;
 +	phys_addr_t size;
-+	phys_addr_t half_size;
 +};
 +
 +static struct guivp_pbmt_test_ctx guivp_pbmt_ctx;
 +
++static int guivp_pbmt_selftest_mapping(phys_addr_t phys, pgprot_t prot, const char *name);
++
 +static const char *guivp_pbmt_region_name(loff_t offset, const struct guivp_pbmt_test_ctx *ctx)
 +{
-+	return offset < ctx->half_size ? "MEM0" : "MEM1";
++	(void)ctx;
++
++	if (offset < GUIVP_REGION_NC_OFFSET)
++		return "PMA";
++	if (offset < GUIVP_REGION_IO_OFFSET)
++		return "NC";
++	return "IO";
 +}
 +
 +static pgprot_t guivp_pbmt_region_pgprot(loff_t offset, pgprot_t prot, const struct guivp_pbmt_test_ctx *ctx)
 +{
-+	return prot;
++	(void)ctx;
++
++	if (offset < GUIVP_REGION_NC_OFFSET)
++		return prot;
++	if (offset < GUIVP_REGION_IO_OFFSET)
++		return pgprot_writecombine(prot);
++	return pgprot_noncached(prot);
++}
++
++static loff_t guivp_pbmt_region_end(loff_t offset, const struct guivp_pbmt_test_ctx *ctx)
++{
++	if (offset < GUIVP_REGION_NC_OFFSET)
++		return GUIVP_REGION_NC_OFFSET;
++	if (offset < GUIVP_REGION_IO_OFFSET)
++		return GUIVP_REGION_IO_OFFSET;
++	return ctx->size;
++}
++
++static bool guivp_pbmt_crosses_region(loff_t offset, loff_t end, const struct guivp_pbmt_test_ctx *ctx)
++{
++	return end > guivp_pbmt_region_end(offset, ctx);
++}
++
++static int guivp_pbmt_selftest_region(const struct guivp_pbmt_test_ctx *ctx, unsigned int region,
++				      pgprot_t prot, const char *name)
++{
++	static const phys_addr_t offsets[] = {
++		GUIVP_REGION_PMA_OFFSET,
++		GUIVP_REGION_NC_OFFSET,
++		GUIVP_REGION_IO_OFFSET,
++	};
++	phys_addr_t phys = ctx->base + offsets[region];
++
++	return guivp_pbmt_selftest_mapping(phys, prot, name);
++}
++
++static pgprot_t guivp_pbmt_selftest_pgprot(unsigned int region)
++{
++	switch (region) {
++	case 0:
++		return PAGE_KERNEL;
++	case 1:
++		return pgprot_writecombine(PAGE_KERNEL);
++	default:
++		return pgprot_noncached(PAGE_KERNEL);
++	}
 +}
 +
 +static int guivp_pbmt_selftest_mapping(phys_addr_t phys, pgprot_t prot, const char *name)
@@ -100,17 +157,16 @@ index 000000000000..6cb8454024a1
 +static int guivp_pbmt_run_selftest(const struct guivp_pbmt_test_ctx *ctx)
 +{
 +	int ret;
-+	phys_addr_t mem0_phys;
-+	phys_addr_t mem1_phys;
++	static const char * const names[] = {"PMA", "NC", "IO"};
++	unsigned int i;
 +
-+	mem0_phys = ctx->base;
-+	mem1_phys = ctx->base + ctx->half_size;
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		ret = guivp_pbmt_selftest_region(ctx, i, guivp_pbmt_selftest_pgprot(i), names[i]);
++		if (ret)
++			return ret;
++	}
 +
-+	ret = guivp_pbmt_selftest_mapping(mem0_phys, PAGE_KERNEL, "MEM0");
-+	if (ret)
-+		return ret;
-+
-+	return guivp_pbmt_selftest_mapping(mem1_phys, PAGE_KERNEL, "MEM1");
++	return 0;
 +}
 +
 +static int guivp_pbmt_open(struct inode *inode, struct file *file)
@@ -134,7 +190,7 @@ index 000000000000..6cb8454024a1
 +	if (offset < 0 || end > ctx->size)
 +		return -EINVAL;
 +
-+	if ((offset < ctx->half_size && end > ctx->half_size) || (offset >= ctx->half_size && end > ctx->size))
++	if (guivp_pbmt_crosses_region(offset, end, ctx))
 +		return -EINVAL;
 +
 +	prot = guivp_pbmt_region_pgprot(offset, vma->vm_page_prot, ctx);
@@ -175,7 +231,7 @@ index 000000000000..6cb8454024a1
 +		return 0;
 +	}
 +
-+	if (rmem->size < (2 * PAGE_SIZE)) {
++	if (rmem->size < GUIVP_REGION_END_OFFSET) {
 +		pr_err("%s: reserved-memory window too small: %pa bytes\n",
 +		       GUIVP_PBMT_TEST_NAME, &rmem->size);
 +		return -EINVAL;
@@ -183,23 +239,22 @@ index 000000000000..6cb8454024a1
 +
 +	guivp_pbmt_ctx.base = rmem->base;
 +	guivp_pbmt_ctx.size = rmem->size;
-+	guivp_pbmt_ctx.half_size = round_down(rmem->size / 2, PAGE_SIZE);
-+	if (!guivp_pbmt_ctx.half_size) {
-+		pr_err("%s: invalid half_size derived from %pa\n",
-+		       GUIVP_PBMT_TEST_NAME, &rmem->size);
-+		return -EINVAL;
-+	}
 +
 +	guivp_pbmt_ctx.miscdev.minor = MISC_DYNAMIC_MINOR;
 +	guivp_pbmt_ctx.miscdev.name = GUIVP_PBMT_TEST_NAME;
 +	guivp_pbmt_ctx.miscdev.fops = &guivp_pbmt_fops;
 +	guivp_pbmt_ctx.miscdev.mode = 0600;
 +
-+	pr_info("%s: reserved window base=%pa size=%pa half=%pa\n",
++	pr_info("%s: reserved window base=%pa size=%pa PMA=%#llx-%#llx NC=%#llx-%#llx IO=%#llx-%#llx\n",
 +		GUIVP_PBMT_TEST_NAME,
 +		&guivp_pbmt_ctx.base,
 +		&guivp_pbmt_ctx.size,
-+		&guivp_pbmt_ctx.half_size);
++		(unsigned long long)GUIVP_REGION_PMA_OFFSET,
++		(unsigned long long)(GUIVP_REGION_NC_OFFSET - 1),
++		(unsigned long long)GUIVP_REGION_NC_OFFSET,
++		(unsigned long long)(GUIVP_REGION_IO_OFFSET - 1),
++		(unsigned long long)GUIVP_REGION_IO_OFFSET,
++		(unsigned long long)(GUIVP_REGION_END_OFFSET - 1));
 +
 +	ret = misc_register(&guivp_pbmt_ctx.miscdev);
 +	if (ret) {
