@@ -9,17 +9,19 @@ three regions using PMA, NC, and IO mappings. A boot-time self-test makes
 it easy to observe all cases without userspace.
 ---
  drivers/misc/Makefile          |  1 +
- drivers/misc/guivp_pbmt_test.c | 441 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 442 insertions(+)
+ drivers/misc/guivp_pbmt_test.c | 496 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 497 insertions(+)
  create mode 100644 drivers/misc/guivp_pbmt_test.c
 
 diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
 index 95c66b5ce1ef..7b3419626c4d 100644
 --- a/drivers/misc/Makefile
 +++ b/drivers/misc/Makefile
-@@ -73,4 +73,5 @@ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
+@@ -70,6 +70,7 @@ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
  obj-$(CONFIG_NSM)		+= nsm.o
  obj-$(CONFIG_MARVELL_CN10K_DPI)	+= mrvl_cn10k_dpi.o
+ lan966x-pci-objs		:= lan966x_pci.o
+ lan966x-pci-objs		+= lan966x_pci.dtbo.o
  obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
 +obj-y				+= guivp_pbmt_test.o
  obj-y				+= keba/
@@ -28,7 +30,7 @@ new file mode 100644
 index 000000000000..6cb8454024a1
 --- /dev/null
 +++ b/drivers/misc/guivp_pbmt_test.c
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,496 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * GUI-VP PBMT test device
@@ -58,6 +60,7 @@ index 000000000000..6cb8454024a1
 +#define GUIVP_PBMT_TEST_NAME "guivp_pbmt_test"
 +#define GUIVP_CACHE_ACE_RMEM_PATH "/reserved-memory/cache-ace@e0000000"
 +#define GUIVP_REGION_PMA_OFFSET 0x00000000ULL
++#define GUIVP_REGION_PMA_MAG_OFFSET 0x0fffc000ULL
 +#define GUIVP_REGION_PMA_RSRV_NONE_OFFSET 0x0fffd000ULL
 +#define GUIVP_REGION_PMA_AMO_OFFSET 0x0fffe000ULL
 +#define GUIVP_REGION_PMA_FAULT_OFFSET 0x0ffff000ULL
@@ -141,6 +144,24 @@ index 000000000000..6cb8454024a1
 +		: [ret] "+r" (ret), [old] "=&r" (oldval),
 +		  [mem] "+m" (*(u64 __force *)addr)
 +		: [op] "r" (op)
++		: "memory");
++
++	*old = oldval;
++	return ret;
++}
++
++static int guivp_pbmt_amo_add_misaligned_nofault(void __iomem *addr, u64 op, u64 *old)
++{
++	long ret = 0;
++	u64 oldval = 0;
++	void *ptr = (void __force *)addr;
++
++	asm volatile(
++		"1: amoadd.d.aqrl %[old], %[op], (%[ptr])\n"
++		"2:\n"
++		_ASM_EXTABLE_UACCESS_ERR(1b, 2b, %[ret])
++		: [ret] "+r" (ret), [old] "=&r" (oldval)
++		: [op] "r" (op), [ptr] "r" (ptr)
 +		: "memory");
 +
 +	*old = oldval;
@@ -295,6 +316,36 @@ index 000000000000..6cb8454024a1
 +	return 0;
 +}
 +
++static int guivp_pbmt_selftest_pma_mag(const struct guivp_pbmt_test_ctx *ctx)
++{
++	phys_addr_t phys = ctx->base + GUIVP_REGION_PMA_MAG_OFFSET;
++	void __iomem *addr;
++	u64 init_vals[4] = {0, 0, 0, 0};
++	u64 ok_old;
++	u64 cross_old;
++	long ok_ret;
++	long cross_ret;
++
++	addr = ioremap_prot(phys, sizeof(init_vals), PAGE_KERNEL);
++	if (!addr)
++		return -ENOMEM;
++
++	memcpy_toio(addr, init_vals, sizeof(init_vals));
++	ok_ret = guivp_pbmt_amo_add_misaligned_nofault(addr + 4, 1, &ok_old);
++	cross_ret = guivp_pbmt_amo_add_misaligned_nofault(addr + 12, 1, &cross_old);
++	iounmap(addr);
++
++	if (ok_ret || !cross_ret) {
++		pr_err("%s: MAG selftest PMA_MAG16 phys=%pa unexpected ok_ret=%ld cross_ret=%ld ok_old=0x%016llx cross_old=0x%016llx\n",
++		       GUIVP_PBMT_TEST_NAME, &phys, ok_ret, cross_ret, ok_old, cross_old);
++		return -EIO;
++	}
++
++	pr_info("%s: MAG selftest PMA_MAG16 phys=%pa ok_ret=%ld cross_ret=%ld PASS\n",
++		GUIVP_PBMT_TEST_NAME, &phys, ok_ret, cross_ret);
++	return 0;
++}
++
 +static int guivp_pbmt_selftest_pma_reservability(const struct guivp_pbmt_test_ctx *ctx)
 +{
 +	phys_addr_t phys = ctx->base + GUIVP_REGION_PMA_RSRV_NONE_OFFSET;
@@ -344,6 +395,10 @@ index 000000000000..6cb8454024a1
 +		return ret;
 +
 +	ret = guivp_pbmt_selftest_pma_amo(ctx);
++	if (ret)
++		return ret;
++
++	ret = guivp_pbmt_selftest_pma_mag(ctx);
 +	if (ret)
 +		return ret;
 +
@@ -430,11 +485,13 @@ index 000000000000..6cb8454024a1
 +	guivp_pbmt_ctx.miscdev.fops = &guivp_pbmt_fops;
 +	guivp_pbmt_ctx.miscdev.mode = 0600;
 +
-+	pr_info("%s: reserved window base=%pa size=%pa PMA=%#llx-%#llx PMA_RSRV_NONE=%#llx-%#llx PMA_AMO_LOGICAL=%#llx-%#llx PMA_DENY=%#llx-%#llx NC=%#llx-%#llx IO=%#llx-%#llx\n",
++	pr_info("%s: reserved window base=%pa size=%pa PMA=%#llx-%#llx PMA_MAG16=%#llx-%#llx PMA_RSRV_NONE=%#llx-%#llx PMA_AMO_LOGICAL=%#llx-%#llx PMA_DENY=%#llx-%#llx NC=%#llx-%#llx IO=%#llx-%#llx\n",
 +		GUIVP_PBMT_TEST_NAME,
 +		&guivp_pbmt_ctx.base,
 +		&guivp_pbmt_ctx.size,
 +		(unsigned long long)GUIVP_REGION_PMA_OFFSET,
++		(unsigned long long)(GUIVP_REGION_PMA_MAG_OFFSET - 1),
++		(unsigned long long)GUIVP_REGION_PMA_MAG_OFFSET,
 +		(unsigned long long)(GUIVP_REGION_PMA_RSRV_NONE_OFFSET - 1),
 +		(unsigned long long)GUIVP_REGION_PMA_RSRV_NONE_OFFSET,
 +		(unsigned long long)(GUIVP_REGION_PMA_AMO_OFFSET - 1),

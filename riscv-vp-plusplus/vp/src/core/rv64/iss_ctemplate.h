@@ -216,7 +216,6 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	                          std::function<int32_t(int32_t, int32_t)> operation) {
 		stats.inc_amo();
 		uxlen_t addr = regs[instr.rs1()];
-		trap_check_addr_alignment<4, false>(addr);
 		int32_t data;
 		try {
 			data = mem->atomic_load_word(addr, amo_class);
@@ -236,7 +235,6 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	inline void execute_amo_d(Instruction &instr, PmaAmoClass amo_class,
 	                          std::function<int64_t(int64_t, int64_t)> operation) {
 		uxlen_t addr = regs[instr.rs1()];
-		trap_check_addr_alignment<8, false>(addr);
 		uint64_t data;
 		try {
 			data = mem->atomic_load_double(addr, amo_class);

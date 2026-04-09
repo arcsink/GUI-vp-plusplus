@@ -1,5 +1,27 @@
 # PMA 变更记录
 
+## 2026-04-09 增加 Misaligned Atomicity Granule Linux 自测
+
+### 变更内容
+
+- Linux 平台 `cache_ace` PMA 窗口新增 `PMA_MAG16` 测试页，物理地址为 `0xEFFFC000-0xEFFFCFFF`，该页继承普通 main-memory AMO/LRSC 属性，并额外设置 `misaligned_atomicity_granule = 16`。
+- RV64 AMO 执行路径移除 ISS 入口处对 `AMO*.W` / `AMO*.D` 的硬性对齐拦截，改为让 misaligned AMO 继续进入 memory interface，由 PMA 的 `is_within_misaligned_atomicity_granule()` 统一决定是否允许。
+- Linux `guivp_pbmt_test` 启动自测新增 `PMA_MAG16` 验证：先在 `addr + 4` 执行 misaligned `amoadd.d.aqrl`，要求完整落在同一个 16-byte granule 内并成功；再在 `addr + 12` 执行 misaligned `amoadd.d.aqrl`，要求跨 granule 并通过 nofault/fixup 路径返回 `-EFAULT`。
+- `linux_patches/0003-misc-add-guivp-pbmt-test-driver.patch` 的 `drivers/misc/Makefile` hunk 更新为匹配当前 Linux 6.15.2 源树中的 `lan966x-pci-objs` 上下文，确保 Buildroot `linux-dirclean` 后可以重新打补丁。
+
+### 变更原因
+
+虽然 PMA 层已经实现了 `is_within_misaligned_atomicity_granule()`，但之前 RV64 AMO 在 ISS 入口就会因为地址未对齐直接抛 `STORE/AMO_ADDR_MISALIGNED`，导致 Linux 实际运行路径根本到不了 MAG PMA 检查。把 AMO 的对齐放行到 PMA 后，Linux 自测才能真正区分“同 granule 的 misaligned atomic 允许”和“跨 granule 的 misaligned atomic 拒绝”。
+
+### 验证结果
+
+- `cmake --build riscv-vp-plusplus/vp/build --target linux64-mc-vp -j$(nproc)`：通过。
+- `make -C buildroot_rv64 linux-dirclean linux-rebuild`：通过，并确认重新编译 `drivers/misc/guivp_pbmt_test.o`。
+- `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY make run_rv64_mc`：Linux 启动到 `buildroot login:`。
+- Linux 日志确认 `PMA_MAG16` 自测通过：`guivp_pbmt_test: MAG selftest PMA_MAG16 phys=0x00000000efffc000 ok_ret=0 cross_ret=-14 PASS`。
+- Linux 日志确认 `PMA_MAG16` 页已被平台正确公布：`guivp_pbmt_test: reserved window base=0x00000000e0000000 size=0x0000000020000000 PMA=0x0-0xfffbfff PMA_MAG16=0xfffc000-0xfffcfff PMA_RSRV_NONE=0xfffd000-0xfffdfff PMA_AMO_LOGICAL=0xfffe000-0xfffefff PMA_DENY=0xffff000-0xfffffff NC=0x10000000-0x17ffffff IO=0x18000000-0x1fffffff`。
+- Linux 日志确认既有 PMA 自测仍保持通过：`PMA_DENY ... PASS`、`PMA_AMO_LOGICAL ... PASS`、`PMA_RSRV_NONE ... PASS`。
+
 ## 2026-04-08 增加 PMA Reservability 检查流程
 
 ### 变更内容

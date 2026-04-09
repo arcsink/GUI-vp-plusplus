@@ -471,18 +471,26 @@ int sc_main(int argc, char **argv) {
 			/* reservability：允许 LR/SC，并声明具备 eventual forward-progress 语义。 */
 			cache_ace_attr.reservability = PmaReservability::RsrvEventual;
 
+			const uint64_t pma_mag_page_offset = 0x0fffc000;
 			const uint64_t pma_rsrv_none_page_offset = 0x0fffd000;
 			const uint64_t pma_amo_page_offset = 0x0fffe000;
 			const uint64_t pma_fault_page_offset = 0x0ffff000;
 			const uint64_t pma_fault_page_size = 0x1000;
 			if (opt.cache_ace_dram_window_size > pma_fault_page_offset + pma_fault_page_size) {
+				const uint64_t pma_mag_page_start = opt.cache_ace_dram_window_start + pma_mag_page_offset;
 				const uint64_t pma_rsrv_none_page_start =
 				    opt.cache_ace_dram_window_start + pma_rsrv_none_page_offset;
 				const uint64_t pma_amo_page_start = opt.cache_ace_dram_window_start + pma_amo_page_offset;
 				const uint64_t pma_fault_page_start =
 				    opt.cache_ace_dram_window_start + pma_fault_page_offset;
-				cores[i]->memif.get_pma().set_region(opt.cache_ace_dram_window_start, pma_rsrv_none_page_offset,
+				cores[i]->memif.get_pma().set_region(opt.cache_ace_dram_window_start, pma_mag_page_offset,
 				                                      cache_ace_attr, MachineMode);
+
+				/* MAG test page：允许 misaligned 8-byte AMO，只要访问完整落在同一个 16-byte granule 内。 */
+				pma_attributes mag_attr = cache_ace_attr;
+				mag_attr.misaligned_atomicity_granule = 16;
+				cores[i]->memif.get_pma().set_region(pma_mag_page_start, pma_fault_page_size, mag_attr,
+				                                      MachineMode);
 
 				/* LR/SC reservability test page：普通读写/AMO 允许，但 LR/SC 应触发 PMA access-fault。 */
 				pma_attributes rsrv_none_attr = cache_ace_attr;
