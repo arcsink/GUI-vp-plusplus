@@ -67,6 +67,8 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	ISS_CT_T_CSR_TABLE csrs;
 	VExtension<ISS_CT> v_ext;
 	PrivilegeLevel prv = MachineMode;
+	bool virt = false;
+	bool trap_to_virtual_supervisor = false;
 
 	// last decoded and executed instruction
 	Instruction instr;
@@ -151,6 +153,21 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		trace = ena;
 		force_slow_path();
 	}
+	void enable_guest_mmio_debug(uxlen_t, uxlen_t, uint32_t) {
+		// H Extension fdw: keep the common memory-interface guest-MMIO debug hooks compile-safe on RV32 even though the current L2 bring-up debugging only targets RV64.
+	}
+	void enable_guest_exec_debug(uint32_t) {
+		// H Extension fdw: RV32 does not participate in the current L2 guest-entry tracing flow; keep the shared platform hook as a no-op here.
+	}
+	bool should_log_guest_mmio_access(uxlen_t) const {
+		return false;
+	}
+	void log_guest_mmio_access(const char *, uxlen_t, uxlen_t, unsigned, uint64_t) {
+		// H Extension fdw: RV32 has no guest-MMIO trace output today; provide a no-op shim so shared templates stay architecture-agnostic.
+	}
+	void maybe_log_guest_exec_progress() {
+		// H Extension fdw: keep the shared guest-exec trace hook compile-safe on RV32 without introducing extra trace output.
+	}
 	bool trace_enabled(void) override {
 		return trace;
 	}
@@ -212,21 +229,20 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
-	inline void execute_amo_w(Instruction &instr, PmaAmoClass amo_class,
-	                          std::function<int32_t(int32_t, int32_t)> operation) {
+	inline void execute_amo_w(Instruction &instr, std::function<int32_t(int32_t, int32_t)> operation) {
 		stats.inc_amo();
 		uxlen_t addr = regs[instr.rs1()];
 		trap_check_addr_alignment<4, false>(addr);
 		int32_t data;
 		try {
-			data = mem->atomic_load_word(addr, amo_class);
+			data = mem->atomic_load_word(addr);
 		} catch (SimulationTrap &e) {
 			if (e.reason == EXC_LOAD_ACCESS_FAULT)
 				e.reason = EXC_STORE_AMO_ACCESS_FAULT;
 			throw e;
 		}
 		int32_t val = operation(data, (int32_t)regs[instr.rs2()]);
-		mem->atomic_store_word(addr, val, amo_class);
+		mem->atomic_store_word(addr, val);
 		// ignore write to zero/x0
 		if (instr.rd() != RegFile::zero) {
 			regs[instr.rd()] = data;
@@ -254,6 +270,22 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 
 	void prepare_interrupt(const PendingInterrupts &x);
 
+	uxlen_t compute_hs_interrupt_enable_mask();  // H Extension fdw: expose only the HS interrupt-enable bits delegated from M
+
+	uxlen_t compute_hs_interrupt_pending_read_mask();  // H Extension fdw: expose only the HS interrupt-pending bits visible through sip
+
+	uxlen_t compute_hs_interrupt_pending_write_mask();  // H Extension fdw: keep HS software-pending bits writable through sip only when delegated from M
+
+	uxlen_t compute_vs_interrupt_enable_mask();  // H Extension fdw: expose only the VS interrupt-enable bits delegated to VS or injected through HVIEN
+
+	uxlen_t compute_vs_visible_interrupt_enables();  // H Extension fdw: merge delegated mie alias bits with explicit VS-only enable state
+
+	uxlen_t compute_vs_interrupt_pending_read_mask();  // H Extension fdw: expose only the VS interrupt-pending bits visible through sip/vsip
+
+	uxlen_t compute_vs_interrupt_pending_write_mask();  // H Extension fdw: keep VS software-pending bits writable through sip/vsip only when delegated to VS
+
+	uxlen_t compute_vs_visible_interrupts();  // H Extension fdw: merge delegated and injected VS-visible interrupt pending bits
+
 	PendingInterrupts compute_pending_interrupts();
 
 	bool has_pending_enabled_interrupts() {
@@ -262,13 +294,14 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL bool has_local_pending_enabled_interrupts() {
-		return csrs.mie.reg.val & csrs.mip.reg.val;
+		return (csrs.mie.reg.val & csrs.mip.reg.val) ||
+		       (virt && (compute_vs_visible_interrupts() & compute_vs_visible_interrupt_enables()));  // H Extension fdw: make WFI/interrupt polling observe the effective VS-visible interrupt-enable view, including delegated alias bits
 	}
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL void return_from_trap_handler(PrivilegeLevel return_mode);
 
-	void switch_to_trap_handler(PrivilegeLevel target_mode);
+	void switch_to_trap_handler(PrivilegeLevel target_mode, const SimulationTrap *trap = nullptr);  // H Extension fdw: pass trap metadata so HS/M can fill htinst/htval/mtinst/mtval2
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL void handle_interrupt();
