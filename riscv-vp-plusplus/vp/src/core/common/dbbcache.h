@@ -1237,6 +1237,10 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 	__always_inline T_uxlen_t get_last_pc_before_callback() {
 		/* taken hit fast */
 		if (likely(in_fast_path())) {
+			if (unlikely(fastEntry == &curBlock->entries[-1])) {
+				// H Extension fdw: when fastEntry still points at the block-start sentinel, debug consumers need the first real entry rather than the sentinel's garbage predecessor slot.
+				return (fastEntry + 1)->pc;
+			}
 			return fastEntry->pc;
 		}
 
@@ -1291,6 +1295,10 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 
 	uint32_t get_mem_word() {
 		if (likely(in_fast_path())) {
+			if (unlikely(fastEntry == &curBlock->entries[-1])) {
+				// H Extension fdw: keep debug-visible mem_word aligned with the first real entry when the fast-path sentinel denotes a freshly entered block.
+				return (fastEntry + 1)->mem_word;
+			}
 			return fastEntry->mem_word;
 		}
 

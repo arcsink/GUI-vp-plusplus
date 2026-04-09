@@ -5,8 +5,6 @@
 #include "dmi.h"
 #include "mem_if.h"
 #include "mmu.h"
-#include "pma.h"
-#include "util/tlm_ext_pbmt.h"
 #include "util/propertytree.h"
 #include "util/tlm_ext_initiator.h"
 
@@ -42,6 +40,10 @@ struct InstrMemoryProxy_T : public instr_memory_if {
 		quantum_keeper.inc(access_delay);
 		return dmi.load<uint32_t>(pc);
 	}
+
+	virtual uint64_t translate_pc(uint64_t pc) override {
+		return pc;
+	}
 };
 
 template <typename T_RVX_ISS, typename T_sxlen_t, typename T_uxlen_t>
@@ -66,10 +68,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 
 	tlm::tlm_generic_payload trans;
 	tlm_ext_initiator *ext;
-	tlm_ext_pbmt *ext_pbmt;
 
 	MMU_T<T_RVX_ISS> *mmu;
-	PMA pma;
 
 	bool last_access_was_dmi = false;
 	void *last_dmi_page_host_addr = nullptr;
@@ -89,17 +89,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 
 		ext = new tlm_ext_initiator(&owner);  // tlm_generic_payload frees all extension objects in destructor,
 		                                      // therefore dynamic allocation is needed
-		ext_pbmt = new tlm_ext_pbmt();
 		trans.set_extension<tlm_ext_initiator>(ext);
-		trans.set_extension<tlm_ext_pbmt>(ext_pbmt);
-	}
-
-	PMA &get_pma() {
-		return pma;
-	}
-
-	const PMA &get_pma() const {
-		return pma;
 	}
 
 	uint64_t v2p(uint64_t vaddr, MemoryAccessType type) override {
@@ -108,100 +98,31 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		return mmu->translate_virtual_to_physical_addr(vaddr, type);
 	}
 
-	static uint8_t pma_memory_type_to_tlm(PmaMemoryType memory_type) {
-		switch (memory_type) {
-			case PmaMemoryType::MainMemory:
-				return tlm_ext_pbmt::PMA_MEMORY_MAIN;
-			case PmaMemoryType::IO:
-				return tlm_ext_pbmt::PMA_MEMORY_IO;
-		}
-		return tlm_ext_pbmt::PMA_MEMORY_MAIN;
+	uint64_t v2p(uint64_t vaddr, MemoryAccessType type, xlate_flags_t flags) {
+		if (mmu == nullptr)
+			return vaddr;
+		return mmu->translate_virtual_to_physical_addr(vaddr, type, flags);
 	}
 
-	static uint8_t pma_ordering_to_tlm(PmaOrdering ordering) {
-		switch (ordering) {
-			case PmaOrdering::RVWMO:
-				return tlm_ext_pbmt::PMA_ORDER_RVWMO;
-			case PmaOrdering::RVTSO:
-				return tlm_ext_pbmt::PMA_ORDER_RVTSO;
-			case PmaOrdering::RelaxedIO:
-				return tlm_ext_pbmt::PMA_ORDER_RELAXED_IO;
-			case PmaOrdering::StrongIO:
-				return tlm_ext_pbmt::PMA_ORDER_STRONG_IO;
-		}
-		return tlm_ext_pbmt::PMA_ORDER_RVWMO;
+	static xlate_flags_t guest_xlate_flags() {
+		xlate_flags_t flags;
+		flags.forced_virt = true;
+		return flags;
 	}
 
-	static void raise_access_fault_for_access(MemoryAccessType type, uint64_t paddr) {
-		switch (type) {
-			case FETCH:
-				raise_trap(EXC_INSTR_ACCESS_FAULT, paddr);
-				break;
-			case LOAD:
-				raise_trap(EXC_LOAD_ACCESS_FAULT, paddr);
-				break;
-			case STORE:
-				raise_trap(EXC_STORE_AMO_ACCESS_FAULT, paddr);
-				break;
-		}
+	static xlate_flags_t guest_exec_xlate_flags() {
+		xlate_flags_t flags;
+		flags.forced_virt = true;
+		flags.hlvx = true;
+		return flags;
 	}
 
-	[[noreturn]] static void raise_pma_bus_error(const pma_check_result &result, uint64_t addr) {
-		throw std::runtime_error("[pma] bus error at " + std::to_string(addr) + ": " + result.reason);
-	}
-
-	[[noreturn]] static void raise_pma_timeout(const pma_check_result &result, uint64_t addr) {
-		throw std::runtime_error("[pma] timeout at " + std::to_string(addr) + ": " + result.reason);
-	}
-
-	pma_check_result check_pma_or_raise(uint64_t paddr, uint64_t size, MemoryAccessType type, bool atomic = false,
-	                                    bool lr_sc = false, bool page_table_access = false, bool implicit = false,
-	                                    MemoryAccessType fault_type = LOAD, uint64_t fault_vaddr = 0,
-	                                    PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) const {
-		pma_check_request request;
-		request.paddr = paddr;
-		request.size = size;
-		request.access_type = type;
-		request.atomic = atomic;
-		request.lr_sc = lr_sc;
-		request.amo_class = amo_class;
-		request.page_table_access = page_table_access;
-		request.implicit = implicit;
-
-		const pma_check_result result = pma.check_access(request);
-		if (result.allowed) {
-			return result;
-		}
-
-		const MemoryAccessType report_type = page_table_access ? fault_type : type;
-		const uint64_t report_addr = page_table_access ? fault_vaddr : paddr;
-		switch (result.failure_response) {
-			case PmaFailureResponse::PreciseAccessFault:
-				/* 规范 3.6 将可精确 trap 的 PMA violation 归为 access-fault，不是 page-fault。 */
-				raise_access_fault_for_access(report_type, report_addr);
-				break;
-			case PmaFailureResponse::BusError:
-				raise_pma_bus_error(result, report_addr);
-				break;
-			case PmaFailureResponse::Timeout:
-				raise_pma_timeout(result, report_addr);
-				break;
-		}
-
-		return result;
-	}
-
-	inline void _do_transaction(tlm::tlm_command cmd, uint64_t addr, uint8_t *data, unsigned num_bytes,
-	                            uint8_t pbmt = tlm_ext_pbmt::PMA,
-	                            const pma_attributes &pma_attr = pma_attributes()) {
+	inline void _do_transaction(tlm::tlm_command cmd, uint64_t addr, uint8_t *data, unsigned num_bytes) {
 		trans.set_command(cmd);
 		trans.set_address(addr);
 		trans.set_data_ptr(data);
 		trans.set_data_length(num_bytes);
 		trans.set_response_status(tlm::TLM_OK_RESPONSE);
-		ext_pbmt->pbmt = pbmt;
-		ext_pbmt->set_pma(pma_memory_type_to_tlm(pma_attr.memory_type), pma_ordering_to_tlm(pma_attr.ordering),
-		                  pma_attr.cacheable, pma_attr.coherent);
 
 		/* ensure, that quantum_keeper value of ISS is up-to-date */
 		iss.commit_cycles();
@@ -228,14 +149,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline T _raw_load_data(uint64_t addr, uint8_t pbmt = tlm_ext_pbmt::PMA, MemoryAccessType type = LOAD,
-	                        bool atomic = false, bool lr_sc = false, bool page_table_access = false,
-	                        bool implicit = false, MemoryAccessType page_fault_type = LOAD,
-	                        uint64_t page_fault_vaddr = 0, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) {
-		const pma_check_result pma_result =
-		    check_pma_or_raise(addr, sizeof(T), type, atomic, lr_sc, page_table_access, implicit, page_fault_type,
-		                       page_fault_vaddr, amo_class);
-
+	inline T _raw_load_data(uint64_t addr) {
 		// NOTE: a DMI load will not context switch (SystemC) and not modify the memory, hence should be able to
 		// postpone the lock after the dmi access
 		bus_lock->wait_for_access_rights(iss.get_hart_id());
@@ -255,7 +169,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			}
 		}
 
-		_do_transaction(tlm::TLM_READ_COMMAND, addr, (uint8_t *)&ans, sizeof(T), pbmt, pma_result.attributes);
+		_do_transaction(tlm::TLM_READ_COMMAND, addr, (uint8_t *)&ans, sizeof(T));
 
 		/*
 		 * A transaction may lead to a context switch. The other context may issue transaction handled via dmi.
@@ -268,14 +182,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline void _raw_store_data(uint64_t addr, T value, uint8_t pbmt = tlm_ext_pbmt::PMA, bool atomic = false,
-	                            bool lr_sc = false, bool page_table_access = false, bool implicit = false,
-	                            MemoryAccessType page_fault_type = STORE, uint64_t page_fault_vaddr = 0,
-	                            PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) {
-		const pma_check_result pma_result =
-		    check_pma_or_raise(addr, sizeof(T), STORE, atomic, lr_sc, page_table_access, implicit, page_fault_type,
-		                       page_fault_vaddr, amo_class);
-
+	inline void _raw_store_data(uint64_t addr, T value) {
 		bus_lock->wait_for_access_rights(iss.get_hart_id());
 
 		for (auto &e : dmi_ranges) {
@@ -292,7 +199,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			}
 		}
 
-		_do_transaction(tlm::TLM_WRITE_COMMAND, addr, (uint8_t *)&value, sizeof(T), pbmt, pma_result.attributes);
+		_do_transaction(tlm::TLM_WRITE_COMMAND, addr, (uint8_t *)&value, sizeof(T));
 		atomic_unlock();
 
 		/* see comment in _raw_load_data */
@@ -300,31 +207,55 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline T _load_data(uint64_t addr, bool atomic = false, bool lr_sc = false,
-	                    PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) {
-		const uint64_t paddr = v2p(addr, LOAD);
-		const uint8_t pbmt = mmu ? mmu->get_last_translation_pbmt() : static_cast<uint8_t>(tlm_ext_pbmt::PMA);
-		return _raw_load_data<T>(paddr, pbmt, LOAD, atomic, lr_sc, false, false, LOAD, 0, amo_class);
+	inline T _load_data(uint64_t addr) {
+		auto paddr = v2p(addr, LOAD);
+		T value = _raw_load_data<T>(paddr);
+		if (iss.should_log_guest_mmio_access(paddr)) {
+			// H Extension fdw: sample translated guest loads at the common memory interface so L2 UART/debug MMIO can be observed regardless of the calling instruction path.
+			iss.log_guest_mmio_access("load", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
+		}
+		return value;
 	}
 
 	template <typename T>
-	inline void _store_data(uint64_t addr, T value, bool atomic = false, bool lr_sc = false,
-	                        PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) {
-		const uint64_t paddr = v2p(addr, STORE);
-		const uint8_t pbmt = mmu ? mmu->get_last_translation_pbmt() : static_cast<uint8_t>(tlm_ext_pbmt::PMA);
-		_raw_store_data(paddr, value, pbmt, atomic, lr_sc, false, false, STORE, 0, amo_class);
+	inline T _load_data(uint64_t addr, xlate_flags_t flags) {
+		auto paddr = v2p(addr, LOAD, flags);
+		T value = _raw_load_data<T>(paddr);
+		if (iss.should_log_guest_mmio_access(paddr)) {
+			// H Extension fdw: keep forced guest-translation accesses visible too, because HLV/HSV and nested-guest bring-up reuse the same translated data path.
+			iss.log_guest_mmio_access("load", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
+		}
+		return value;
 	}
 
-	uint64_t mmu_load_pte64(uint64_t addr, MemoryAccessType fault_type, uint64_t fault_vaddr) override {
-		return _raw_load_data<uint64_t>(addr, tlm_ext_pbmt::PMA, LOAD, false, false, true, true, fault_type,
-		                                fault_vaddr);
+	template <typename T>
+	inline void _store_data(uint64_t addr, T value) {
+		auto paddr = v2p(addr, STORE);
+		if (iss.should_log_guest_mmio_access(paddr)) {
+			// H Extension fdw: log translated guest stores before the transaction so silent UART writes can still be recovered even if the downstream device path is broken.
+			iss.log_guest_mmio_access("store", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
+		}
+		_raw_store_data(paddr, value);
 	}
-	uint64_t mmu_load_pte32(uint64_t addr, MemoryAccessType fault_type, uint64_t fault_vaddr) override {
-		return _raw_load_data<uint32_t>(addr, tlm_ext_pbmt::PMA, LOAD, false, false, true, true, fault_type,
-		                                fault_vaddr);
+
+	template <typename T>
+	inline void _store_data(uint64_t addr, T value, xlate_flags_t flags) {
+		auto paddr = v2p(addr, STORE, flags);
+		if (iss.should_log_guest_mmio_access(paddr)) {
+			// H Extension fdw: mirror guest-store logging for forced guest translations so debug output stays consistent across nested translation entry points.
+			iss.log_guest_mmio_access("store", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
+		}
+		_raw_store_data(paddr, value);
 	}
-	void mmu_store_pte32(uint64_t addr, uint32_t value, MemoryAccessType fault_type, uint64_t fault_vaddr) override {
-		_raw_store_data(addr, value, tlm_ext_pbmt::PMA, false, false, true, true, fault_type, fault_vaddr);
+
+	uint64_t mmu_load_pte64(uint64_t addr) override {
+		return _raw_load_data<uint64_t>(addr);
+	}
+	uint64_t mmu_load_pte32(uint64_t addr) override {
+		return _raw_load_data<uint32_t>(addr);
+	}
+	void mmu_store_pte32(uint64_t addr, uint32_t value) override {
+		_raw_store_data(addr, value);
 	}
 
 	void flush_tlb() override {
@@ -358,26 +289,39 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		 *
 		 */
 		if ((addr & 0xFFF) == 0xFFE) {
-			const uint64_t hi_paddr = v2p(addr + 2, FETCH);
-			const uint8_t hi_pbmt = mmu ? mmu->get_last_translation_pbmt() : static_cast<uint8_t>(tlm_ext_pbmt::PMA);
-			const uint64_t lo_paddr = v2p(addr + 0, FETCH);
-			const uint8_t lo_pbmt = mmu ? mmu->get_last_translation_pbmt() : static_cast<uint8_t>(tlm_ext_pbmt::PMA);
-			return (_raw_load_data<uint16_t>(hi_paddr, hi_pbmt, FETCH, false, false, false, true) << 16) |
-			       (_raw_load_data<uint16_t>(lo_paddr, lo_pbmt, FETCH, false, false, false, true) << 0);
+			uint64_t paddr_lo = v2p(addr + 0, FETCH);
+			uint64_t paddr_hi = v2p(addr + 2, FETCH);
+			uint32_t raw = (_raw_load_data<uint16_t>(paddr_hi) << 16) | (_raw_load_data<uint16_t>(paddr_lo) << 0);
+			if (iss.should_log_guest_fetch_xlate(addr)) {
+				// H Extension fdw: keep guest fetch translation logs valid even for split page-boundary fetches by reporting the low-half translated address together with the reconstructed 32-bit word.
+				iss.log_guest_fetch_xlate(addr, paddr_lo, raw);
+			}
+			return raw;
 		}
 
-		const uint64_t paddr = v2p(addr, FETCH);
-		const uint8_t pbmt = mmu ? mmu->get_last_translation_pbmt() : static_cast<uint8_t>(tlm_ext_pbmt::PMA);
-		return _raw_load_data<uint32_t>(paddr, pbmt, FETCH, false, false, false, true);
+		uint64_t paddr = v2p(addr, FETCH);
+		uint32_t raw = _raw_load_data<uint32_t>(paddr);
+		if (iss.should_log_guest_fetch_xlate(addr)) {
+			// H Extension fdw: log the guest fetch VA->PA mapping at the point of instruction load so Spike/VP++ entry mismatches can be localized before decode or branch execution.
+			iss.log_guest_fetch_xlate(addr, paddr, raw);
+		}
+		return raw;
+	}
+
+	uint64_t translate_pc(uint64_t addr) override {
+		if ((addr & 0xFFF) == 0xFFE) {
+			return v2p(addr + 0, FETCH);
+		}
+		return v2p(addr, FETCH);
 	}
 
 	template <typename T>
-	T _atomic_load_data(uint64_t addr, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) {
+	T _atomic_load_data(uint64_t addr) {
 		bus_lock->lock(iss.get_hart_id());
-		return _load_data<T>(addr, true, false, amo_class);
+		return _load_data<T>(addr);
 	}
 	template <typename T>
-	void _atomic_store_data(uint64_t addr, T value, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) {
+	void _atomic_store_data(uint64_t addr, T value) {
 		/*
 		 * This is sometimes triggerd when running RV64 debian and apt.
 		 * TODO: check cause and fix
@@ -387,28 +331,22 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			             "developers)"
 			          << std::endl;
 		}
-		_store_data(addr, value, true, false, amo_class);
+		_store_data(addr, value);
 	}
 	template <typename T>
 	T _atomic_load_reserved_data(uint64_t addr) {
 		bus_lock->lock(iss.get_hart_id());
 		lr_addr = addr;
-		return _load_data<T>(addr, true, true, PmaAmoClass::AMONone);
-	}
-	template <typename T>
-	void _check_store_conditional_pma(uint64_t addr) {
-		const uint64_t paddr = v2p(addr, STORE);
-		check_pma_or_raise(paddr, sizeof(T), STORE, true, true, false, false, STORE, 0, PmaAmoClass::AMONone);
+		return _load_data<T>(addr);
 	}
 	template <typename T>
 	bool _atomic_store_conditional_data(uint64_t addr, T value) {
 		/* According to the RISC-V ISA, an implementation can fail each LR/SC sequence that does not satisfy the forward
 		 * progress semantic.
 		 * The lock is established by the LR instruction and the lock is kept while forward progress is maintained. */
-		_check_store_conditional_pma<T>(addr);
 		if (bus_lock->is_locked(iss.get_hart_id())) {
 			if (addr == lr_addr) {
-				_store_data(addr, value, true, true, PmaAmoClass::AMONone);
+				_store_data(addr, value);
 				return true;
 			}
 			atomic_unlock();
@@ -419,47 +357,85 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	int64_t load_double(uint64_t addr) override {
 		return _load_data<int64_t>(addr);
 	}
+	int64_t guest_load_double(uint64_t addr) override {
+		return _load_data<int64_t>(addr, guest_xlate_flags());
+	}
 	T_sxlen_t load_word(uint64_t addr) override {
 		return _load_data<int32_t>(addr);
+	}
+	T_sxlen_t guest_load_word(uint64_t addr) override {
+		return _load_data<int32_t>(addr, guest_xlate_flags());
 	}
 	T_sxlen_t load_half(uint64_t addr) override {
 		return _load_data<int16_t>(addr);
 	}
+	T_sxlen_t guest_load_half(uint64_t addr) override {
+		return _load_data<int16_t>(addr, guest_xlate_flags());
+	}
 	T_sxlen_t load_byte(uint64_t addr) override {
 		return _load_data<int8_t>(addr);
+	}
+	T_sxlen_t guest_load_byte(uint64_t addr) override {
+		return _load_data<int8_t>(addr, guest_xlate_flags());
 	}
 
 	/* unused on RV32 */
 	T_uxlen_t load_uword(uint64_t addr) override {
 		return _load_data<uint32_t>(addr);
 	}
+	T_uxlen_t guest_load_uword(uint64_t addr) override {
+		return _load_data<uint32_t>(addr, guest_xlate_flags());
+	}
+	T_uxlen_t guest_load_exec_uword(uint64_t addr) override {
+		return _load_data<uint32_t>(addr, guest_exec_xlate_flags());
+	}
 
 	T_uxlen_t load_uhalf(uint64_t addr) override {
 		return _load_data<uint16_t>(addr);
 	}
+	T_uxlen_t guest_load_uhalf(uint64_t addr) override {
+		return _load_data<uint16_t>(addr, guest_xlate_flags());
+	}
+	T_uxlen_t guest_load_exec_uhalf(uint64_t addr) override {
+		return _load_data<uint16_t>(addr, guest_exec_xlate_flags());
+	}
 	T_uxlen_t load_ubyte(uint64_t addr) override {
 		return _load_data<uint8_t>(addr);
+	}
+	T_uxlen_t guest_load_ubyte(uint64_t addr) override {
+		return _load_data<uint8_t>(addr, guest_xlate_flags());
 	}
 
 	void store_double(uint64_t addr, uint64_t value) override {
 		_store_data(addr, value);
 	}
+	void guest_store_double(uint64_t addr, uint64_t value) override {
+		_store_data(addr, value, guest_xlate_flags());
+	}
 	void store_word(uint64_t addr, uint32_t value) override {
 		_store_data(addr, value);
+	}
+	void guest_store_word(uint64_t addr, uint32_t value) override {
+		_store_data(addr, value, guest_xlate_flags());
 	}
 	void store_half(uint64_t addr, uint16_t value) override {
 		_store_data(addr, value);
 	}
+	void guest_store_half(uint64_t addr, uint16_t value) override {
+		_store_data(addr, value, guest_xlate_flags());
+	}
 	void store_byte(uint64_t addr, uint8_t value) override {
 		_store_data(addr, value);
 	}
-
-	T_sxlen_t atomic_load_word(uint64_t addr, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) override {
-		return _atomic_load_data<int32_t>(addr, amo_class);
+	void guest_store_byte(uint64_t addr, uint8_t value) override {
+		_store_data(addr, value, guest_xlate_flags());
 	}
-	void atomic_store_word(uint64_t addr, uint32_t value,
-	                       PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) override {
-		_atomic_store_data(addr, value, amo_class);
+
+	T_sxlen_t atomic_load_word(uint64_t addr) override {
+		return _atomic_load_data<int32_t>(addr);
+	}
+	void atomic_store_word(uint64_t addr, uint32_t value) override {
+		_atomic_store_data(addr, value);
 	}
 	T_sxlen_t atomic_load_reserved_word(uint64_t addr) override {
 		return _atomic_load_reserved_data<int32_t>(addr);
@@ -469,12 +445,11 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	/* unused on RV32 */
-	int64_t atomic_load_double(uint64_t addr, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) override {
-		return _atomic_load_data<int64_t>(addr, amo_class);
+	int64_t atomic_load_double(uint64_t addr) override {
+		return _atomic_load_data<int64_t>(addr);
 	}
-	void atomic_store_double(uint64_t addr, uint64_t value,
-	                         PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) override {
-		_atomic_store_data(addr, value, amo_class);
+	void atomic_store_double(uint64_t addr, uint64_t value) override {
+		_atomic_store_data(addr, value);
 	}
 	int64_t atomic_load_reserved_double(uint64_t addr) override {
 		return _atomic_load_reserved_data<int64_t>(addr);

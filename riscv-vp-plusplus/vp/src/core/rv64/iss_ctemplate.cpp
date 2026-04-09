@@ -216,6 +216,249 @@ void ISS_CT::print_trace() {
 	}
 	puts("");
 }
+
+static const char *early_boot_priv_name(PrivilegeLevel level) {
+	switch (level) {
+		case UserMode:
+			return "U";
+		case SupervisorMode:
+			return "S";
+		case HypervisorMode:
+			return "HS";
+		case MachineMode:
+			return "M";
+		case NoneMode:
+			return "-";
+		default:
+			return "?";
+	}
+}
+
+void ISS_CT::enable_early_boot_debug(uxlen_t firmware_entry, uxlen_t kernel_addr, uxlen_t dtb_addr, uint32_t budget) {
+	// H Extension fdw: keep early Linux/OpenSBI handoff debugging behind an explicit runtime switch so normal runs stay quiet.
+	early_boot_debug = true;
+	early_boot_firmware_entry = firmware_entry;
+	early_boot_kernel_addr = kernel_addr;
+	early_boot_dtb_addr = dtb_addr;
+	early_boot_log_budget = budget;
+	early_boot_last_prv = prv;
+	early_boot_last_virt = virt;
+	early_boot_seen_kernel = false;
+	force_slow_path();
+
+	std::cout << "[vp::earlyboot] hart " << get_hart_id() << " armed"
+	          << " fw_entry=0x" << std::hex << early_boot_firmware_entry
+	          << " kernel=0x" << early_boot_kernel_addr
+	          << " dtb=0x" << early_boot_dtb_addr
+	          << " pc=0x" << pc << std::dec << std::endl;
+}
+
+void ISS_CT::enable_guest_mmio_debug(uxlen_t start, uxlen_t end, uint32_t budget) {
+	// H Extension fdw: arm a focused guest-MMIO observer so L2 bring-up can be reduced to concrete UART-range accesses instead of a silent lkvm run.
+	guest_mmio_debug = true;
+	guest_mmio_debug_start = start;
+	guest_mmio_debug_end = end;
+	guest_mmio_debug_budget = budget;
+	force_slow_path();
+
+	std::cout << "[vp::guest-mmio] hart " << get_hart_id() << " armed"
+	          << " start=0x" << std::hex << guest_mmio_debug_start
+	          << " end=0x" << guest_mmio_debug_end
+	          << " budget=" << std::dec << guest_mmio_debug_budget
+	          << std::endl;
+}
+
+void ISS_CT::enable_guest_exec_debug(uint32_t budget) {
+	// H Extension fdw: capture only the first guest-mode instructions so VP++ L2 entry can be compared directly against the Spike good path without enabling full architectural trace.
+	guest_exec_debug = true;
+	guest_exec_debug_budget = budget;
+	guest_fetch_xlate_budget = budget;
+	guest_exec_have_prev = false;
+	guest_exec_prev_pc = 0;
+	guest_exec_prev_instr = 0;
+	guest_fetch_have_last_logged_pc = false;
+	guest_fetch_last_logged_pc = 0;
+	force_slow_path();
+
+	std::cout << "[vp::guest-exec] hart " << get_hart_id() << " armed"
+	          << " budget=" << std::dec << guest_exec_debug_budget
+	          << std::endl;
+}
+
+bool ISS_CT::should_log_guest_mmio_access(uxlen_t paddr) const {
+	return guest_mmio_debug && guest_mmio_debug_budget > 0 && virt && guest_mmio_debug_start <= guest_mmio_debug_end &&
+	       paddr >= guest_mmio_debug_start && paddr <= guest_mmio_debug_end;
+}
+
+bool ISS_CT::should_log_guest_fetch_xlate(uxlen_t vaddr) const {
+	// H Extension fdw: extend the guest fetch visibility beyond the very first entry page so post-0x802010fe progress
+	// can be aligned against Spike without enabling full trace.
+	return guest_exec_debug && guest_fetch_xlate_budget > 0 && virt && vaddr >= 0x80200000 && vaddr < 0x80208000;
+}
+
+void ISS_CT::log_guest_mmio_access(const char *op, uxlen_t vaddr, uxlen_t paddr, unsigned size, uint64_t value) {
+	if (!should_log_guest_mmio_access(paddr)) {
+		return;
+	}
+
+	// H Extension fdw: capture the first L2 MMIO touches with PC/privilege/translation context so guest UART silence can be separated from guest non-execution.
+	std::cout << "[vp::guest-mmio] hart " << get_hart_id()
+	          << " op=" << op
+	          << " pc=0x" << std::hex << pc
+	          << " prv=" << early_boot_priv_name(prv)
+	          << " virt=" << virt
+	          << " vaddr=0x" << vaddr
+	          << " paddr=0x" << paddr
+	          << " size=" << std::dec << size
+	          << " value=0x" << std::hex << value
+	          << " satp=0x" << csrs.satp.reg.val
+	          << " vsatp=0x" << csrs.vsatp.reg.val
+	          << " hgatp=0x" << csrs.hgatp.reg.val
+	          << std::dec << std::endl;
+
+	--guest_mmio_debug_budget;
+}
+
+void ISS_CT::log_guest_fetch_xlate(uxlen_t vaddr, uxlen_t paddr, uint32_t raw_word) {
+	if (!should_log_guest_fetch_xlate(vaddr)) {
+		return;
+	}
+
+	// H Extension fdw: expose the guest fetch translation tuple (guest VA, resolved host PA, loaded word) so L2 entry mismatches against Spike can be reduced to a concrete xlate/fetch difference.
+	std::cout << "[vp::guest-xlate] hart " << get_hart_id()
+	          << " vaddr=0x" << std::hex << vaddr
+	          << " paddr=0x" << paddr
+	          << " raw=0x" << raw_word
+	          << " prv=" << early_boot_priv_name(prv)
+	          << " virt=" << virt
+	          << " satp=0x" << csrs.satp.reg.val
+	          << " vsatp=0x" << csrs.vsatp.reg.val
+	          << " hgatp=0x" << csrs.hgatp.reg.val
+	          << std::dec << std::endl;
+
+	--guest_fetch_xlate_budget;
+}
+
+void ISS_CT::maybe_log_guest_exec_progress() {
+	if (!guest_exec_debug || guest_exec_debug_budget == 0 || !virt) {
+		return;
+	}
+
+	const uxlen_t current_pc = dbbcache.get_last_pc_before_callback();
+	const uxlen_t next_pc = dbbcache.get_pc_maybe_after_callback();
+	const uint32_t current_instr = dbbcache.get_mem_word();
+
+	// H Extension fdw: log current-PC/current-instruction separately from next-PC so L2 entry traces are not distorted by DBBCache's post-decode PC state.
+	std::cout << "[vp::guest-exec] hart " << get_hart_id()
+	          << " current_pc=0x" << std::hex << current_pc
+	          << " instr=0x" << current_instr
+	          << " next_pc=0x" << next_pc
+	          << " prev_pc=0x" << guest_exec_prev_pc
+	          << " prev_instr=0x" << guest_exec_prev_instr
+	          << " prev_next_pc=0x" << (guest_exec_have_prev ? current_pc : uxlen_t(0))
+	          << " prv=" << early_boot_priv_name(prv)
+	          << " virt=" << virt
+	          << " satp=0x" << csrs.satp.reg.val
+	          << " vsatp=0x" << csrs.vsatp.reg.val
+	          << " hgatp=0x" << csrs.hgatp.reg.val
+	          << std::dec << std::endl;
+
+	guest_exec_prev_pc = current_pc;
+	guest_exec_prev_instr = current_instr;
+	guest_exec_have_prev = true;
+	--guest_exec_debug_budget;
+	force_slow_path();
+}
+
+void ISS_CT::maybe_log_guest_fetch_decode(uxlen_t current_pc, uxlen_t next_pc, uint32_t raw_instr) {
+	if (!guest_exec_debug || guest_exec_debug_budget == 0 || !virt) {
+		return;
+	}
+	if (guest_fetch_have_last_logged_pc && guest_fetch_last_logged_pc == current_pc) {
+		return;
+	}
+
+	uxlen_t fetch_paddr = 0;
+	if (instr_mem != nullptr) {
+		fetch_paddr = instr_mem->translate_pc(current_pc);
+	}
+
+	// H Extension fdw: record the post-fetch guest tuple (current PC, raw fetched word, decode result) so VP++ can be compared directly against Spike without the pre-fetch cache-state ambiguity.
+	std::cout << "[vp::guest-fetch] hart " << get_hart_id()
+	          << " pc=0x" << std::hex << current_pc
+	          << " paddr=0x" << fetch_paddr
+	          << " raw=0x" << raw_instr
+	          << " next_pc=0x" << next_pc
+	          << " prv=" << early_boot_priv_name(prv)
+	          << " virt=" << virt
+	          << " satp=0x" << csrs.satp.reg.val
+	          << " vsatp=0x" << csrs.vsatp.reg.val
+	          << " hgatp=0x" << csrs.hgatp.reg.val
+	          << std::dec << std::endl;
+
+	guest_fetch_have_last_logged_pc = true;
+	guest_fetch_last_logged_pc = current_pc;
+	--guest_exec_debug_budget;
+	force_slow_path();
+}
+
+void ISS_CT::maybe_log_early_boot_progress() {
+	if (!early_boot_debug || early_boot_log_budget == 0) {
+		return;
+	}
+
+	const bool priv_changed = (prv != early_boot_last_prv) || (virt != early_boot_last_virt);
+	const bool entered_kernel = !early_boot_seen_kernel && early_boot_kernel_addr && pc >= early_boot_kernel_addr;
+	if (!priv_changed && !entered_kernel) {
+		return;
+	}
+
+	// H Extension fdw: log the first privilege/virtualization transitions and first entry into the kernel address range so OpenSBI->Linux handoff stays observable without full trace spam.
+	std::cout << "[vp::earlyboot] hart " << get_hart_id()
+	          << " pc=0x" << std::hex << pc
+	          << " prv=" << early_boot_priv_name(prv)
+	          << " virt=" << virt
+	          << " a0=0x" << regs[RegFile::a0]
+	          << " a1=0x" << regs[RegFile::a1]
+	          << " satp=0x" << csrs.satp.reg.val
+	          << " vsatp=0x" << csrs.vsatp.reg.val
+	          << " hgatp=0x" << csrs.hgatp.reg.val
+	          << " mepc=0x" << csrs.mepc.reg.val
+	          << " sepc=0x" << csrs.sepc.reg.val
+	          << " stvec=0x" << csrs.stvec.reg.val
+	          << " mtvec=0x" << csrs.mtvec.reg.val
+	          << (entered_kernel ? " entered-kernel" : "")
+	          << std::dec << std::endl;
+
+	early_boot_last_prv = prv;
+	early_boot_last_virt = virt;
+	early_boot_seen_kernel = early_boot_seen_kernel || entered_kernel;
+	early_boot_log_budget--;
+}
+
+void ISS_CT::log_early_boot_trap(const SimulationTrap &e, PrivilegeLevel target_mode, uxlen_t last_pc) {
+	if (!early_boot_debug || early_boot_log_budget == 0) {
+		return;
+	}
+
+	// H Extension fdw: surface the earliest trap metadata during firmware->kernel handoff so silent boot failures can be reduced to a concrete cause/tval/pc tuple.
+	std::cout << "[vp::earlyboot] hart " << get_hart_id()
+	          << " trap reason=" << e.reason
+	          << " last_pc=0x" << std::hex << last_pc
+	          << " mtval=0x" << e.mtval
+	          << " tval2=0x" << e.tval2
+	          << " tinst=0x" << e.tinst
+	          << " target=" << early_boot_priv_name(target_mode)
+	          << " prv=" << early_boot_priv_name(prv)
+	          << " virt=" << virt
+	          << " satp=0x" << csrs.satp.reg.val
+	          << " vsatp=0x" << csrs.vsatp.reg.val
+	          << " hgatp=0x" << csrs.hgatp.reg.val
+	          << " stvec=0x" << csrs.stvec.reg.val
+	          << " mtvec=0x" << csrs.mtvec.reg.val
+	          << std::dec << std::endl;
+	early_boot_log_budget--;
+}
 }  // namespace rv64
 
 /*
@@ -292,6 +535,7 @@ void *ISS_CT::genOpMap() {
 	stats.inc_cnt();                                                        \
 	stats.inc_slow_fdd();                                                   \
 	void *opLabelPtr = dbbcache.fetch_decode(pc, instr);                    \
+	maybe_log_guest_fetch_decode(dbbcache.get_last_pc_before_callback(), pc, dbbcache.get_mem_word()); \
 	if (trace) {                                                            \
 		print_trace();                                                      \
 		/* always stay in slow path if trace enabled */                     \
@@ -369,6 +613,7 @@ void *ISS_CT::genOpMap() {
 #define OP_END() goto OP_LABEL(op_global_fast_finalize_and_fdd)
 #endif
 
+
 /*
  * supress "ISO C++ forbids computed gotos [-Wpedantic]" warings by disabling -Wpedantic for exec_steps
  */
@@ -403,6 +648,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				if (unlikely(iss_slow_path)) {
 					iss_slow_path = false;
+					maybe_log_early_boot_progress();  // H Extension fdw: sample the first firmware/kernel handoff state transitions whenever execution re-enters the architectural slow path
 
 					/* update counters by local fast counters */
 					commit_instructions(ninstr);
@@ -662,6 +908,18 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(J) {
 					stats.inc_j();
+					if (virt) {
+						const uxlen_t current_pc = dbbcache.get_last_pc_before_callback();
+						if (current_pc >= 0x80200000 && current_pc < 0x80200020) {
+							// H Extension fdw: log the first guest J target directly at execution time so Spike and VP++ can be compared on the actual runtime branch target, not inferred from surrounding trace lines.
+							std::cout << "[vp::guest-jump] hart " << get_hart_id()
+							          << " pc=0x" << std::hex << current_pc
+							          << " instr=0x" << instr.data()
+							          << " imm=0x" << instr.J_imm()
+							          << " target=0x" << (current_pc + instr.J_imm())
+							          << std::dec << std::endl;
+						}
+					}
 					dbbcache.jump(instr.J_imm());
 					if (unlikely(ninstr > fast_quantum_ins_granularity)) {
 						ninstr++;
@@ -949,7 +1207,11 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 								raise_trap(EXC_ECALL_M_MODE, last_pc);
 								break;
 							case SupervisorMode:
-								raise_trap(EXC_ECALL_S_MODE, last_pc);
+								if (virt) {
+									raise_trap(EXC_ECALL_VS_MODE, last_pc);  // H Extension fdw: VS ECALL must report virtual-supervisor-ecall
+								} else {
+									raise_trap(EXC_ECALL_S_MODE, last_pc);
+								}
 								break;
 							case UserMode:
 								raise_trap(EXC_ECALL_U_MODE, last_pc);
@@ -1233,17 +1495,18 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<4, false>(addr);
 					int32_t val = regs[instr.rs2()];
-					regs[instr.rd()] = 1;  // failure by default (in case a trap is thrown)
-					regs[instr.rd()] = mem->atomic_store_conditional_word(addr, val)
-					                       ? 0
-					                       : 1;  // overwrite result (in case no trap is thrown)
+					const auto sc_ok = mem->atomic_store_conditional_word(addr, val);
+					// H Extension fdw: defer SC writeback until after the store path completes so traps do not
+					// transiently corrupt x0/rd state before trap-entry CSR code runs.
+					if (instr.rd() != RegFile::zero)
+						regs[instr.rd()] = sc_ok ? 0 : 1;
 					lr_sc_counter = 0;
 					reset_reg_zero();
 				}
 				OP_END();
 
 				OP_CASE(AMOSWAP_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOSwap, [](int32_t a, int32_t b) {
+					execute_amo_w(instr, [](int32_t a, int32_t b) {
 						(void)a;
 						return b;
 					});
@@ -1251,42 +1514,42 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(AMOADD_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return a + b; });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return a + b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOXOR_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOLogical, [](int32_t a, int32_t b) { return a ^ b; });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return a ^ b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOAND_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOLogical, [](int32_t a, int32_t b) { return a & b; });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return a & b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOOR_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOLogical, [](int32_t a, int32_t b) { return a | b; });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return a | b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOMIN_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return std::min(a, b); });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return std::min(a, b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMINU_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return std::min((uint32_t)a, (uint32_t)b); });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return std::min((uint32_t)a, (uint32_t)b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMAX_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return std::max(a, b); });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return std::max(a, b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMAXU_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return std::max((uint32_t)a, (uint32_t)b); });
+					execute_amo_w(instr, [](int32_t a, int32_t b) { return std::max((uint32_t)a, (uint32_t)b); });
 				}
 				OP_END();
 
@@ -1309,17 +1572,18 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<8, false>(addr);
 					uint64_t val = regs[instr.rs2()];
-					regs[instr.rd()] = 1;  // failure by default (in case a trap is thrown)
-					regs[instr.rd()] = mem->atomic_store_conditional_double(addr, val)
-					                       ? 0
-					                       : 1;  // overwrite result (in case no trap is thrown)
+					const auto sc_ok = mem->atomic_store_conditional_double(addr, val);
+					// H Extension fdw: defer SC writeback until after the store path completes so traps do not
+					// transiently corrupt x0/rd state before trap-entry CSR code runs.
+					if (instr.rd() != RegFile::zero)
+						regs[instr.rd()] = sc_ok ? 0 : 1;
 					lr_sc_counter = 0;
 					reset_reg_zero();
 				}
 				OP_END();
 
 				OP_CASE(AMOSWAP_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOSwap, [](int64_t a, int64_t b) {
+					execute_amo_d(instr, [](int64_t a, int64_t b) {
 						(void)a;
 						return b;
 					});
@@ -1327,42 +1591,42 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(AMOADD_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOArithmetic, [](int64_t a, int64_t b) { return a + b; });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return a + b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOXOR_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOLogical, [](int64_t a, int64_t b) { return a ^ b; });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return a ^ b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOAND_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOLogical, [](int64_t a, int64_t b) { return a & b; });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return a & b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOOR_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOLogical, [](int64_t a, int64_t b) { return a | b; });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return a | b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOMIN_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOArithmetic, [](int64_t a, int64_t b) { return std::min(a, b); });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return std::min(a, b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMINU_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOArithmetic, [](int64_t a, int64_t b) { return std::min((uint64_t)a, (uint64_t)b); });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return std::min((uint64_t)a, (uint64_t)b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMAX_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOArithmetic, [](int64_t a, int64_t b) { return std::max(a, b); });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return std::max(a, b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMAXU_D) {
-					execute_amo_d(instr, PmaAmoClass::AMOArithmetic, [](int64_t a, int64_t b) { return std::max((uint64_t)a, (uint64_t)b); });
+					execute_amo_d(instr, [](int64_t a, int64_t b) { return std::max((uint64_t)a, (uint64_t)b); });
 				}
 				OP_END();
 
@@ -7003,6 +7267,192 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				}
 				OP_END();
 
+				OP_CASE(HFENCE_GVMA) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: HFENCE.GVMA executed with V=1 must raise virtual-instruction before privilege checks
+					if (s_mode() && csrs.mstatus.reg.fields.tvm)
+						RAISE_ILLEGAL_INSTRUCTION();  // H Extension fdw: HFENCE.GVMA follows TVM-gated HS/M privilege rules in non-virtual execution
+					if (!(s_mode() || prv == MachineMode))
+						RAISE_ILLEGAL_INSTRUCTION();
+					dbbcache.fence_vma(pc);
+					lscache.fence_vma();
+					stats.inc_fence_vma();
+				}
+				OP_END();
+
+				OP_CASE(HFENCE_VVMA) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: HFENCE.VVMA executed with V=1 must raise virtual-instruction before privilege checks
+					if (!(s_mode() || prv == MachineMode))
+						RAISE_ILLEGAL_INSTRUCTION();
+					dbbcache.fence_vma(pc);
+					lscache.fence_vma();
+					stats.inc_fence_vma();
+				}
+				OP_END();
+
+				OP_CASE(HLV_B) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: HLV/HLVX must trap as virtual-instruction in VS/VU before any further privilege checks
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();  // H Extension fdw: U-mode guest-load access is only legal when hstatus.HU authorizes HLV/HLVX from U
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					regs[instr.rd()] = mem->guest_load_byte(addr);  // H Extension fdw: route HLV.B through the shared guest-translation memory path instead of trapping unconditionally
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLV_BU) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					regs[instr.rd()] = mem->guest_load_ubyte(addr);  // H Extension fdw: reuse the shared guest-load path for HLV.BU
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLV_H) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<2, true>(addr);
+					regs[instr.rd()] = mem->guest_load_half(addr);  // H Extension fdw: route HLV.H through the shared guest-translation memory path instead of trapping unconditionally
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLV_HU) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<2, true>(addr);
+					regs[instr.rd()] = mem->guest_load_uhalf(addr);  // H Extension fdw: route HLV.HU through the shared guest-translation memory path
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLVX_HU) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<2, true>(addr);
+					regs[instr.rd()] = mem->guest_load_exec_uhalf(addr);  // H Extension fdw: route HLVX.HU through the shared guest-load path with execute-like permission checks
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLV_W) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<4, true>(addr);
+					regs[instr.rd()] = mem->guest_load_word(addr);  // H Extension fdw: route HLV.W through the shared guest-translation memory path
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLV_WU) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<4, true>(addr);
+					regs[instr.rd()] = mem->guest_load_uword(addr);  // H Extension fdw: route HLV.WU through the shared guest-translation memory path
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLVX_WU) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<4, true>(addr);
+					regs[instr.rd()] = mem->guest_load_exec_uword(addr);  // H Extension fdw: route HLVX.WU through the shared guest-load path with execute-like permission checks
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HLV_D) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<8, true>(addr);
+					regs[instr.rd()] = mem->guest_load_double(addr);  // H Extension fdw: route HLV.D through the shared guest-translation memory path
+					reset_reg_zero();
+				}
+				OP_END();
+
+				OP_CASE(HSV_B) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: HSV must trap as virtual-instruction in VS/VU before any further privilege checks
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();  // H Extension fdw: U-mode guest-store access is only legal when hstatus.HU authorizes HSV from U
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					mem->guest_store_byte(addr, regs[instr.rs2()]);  // H Extension fdw: route HSV.B through the shared guest-translation memory path instead of trapping unconditionally
+				}
+				OP_END();
+
+				OP_CASE(HSV_H) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<2, false>(addr);
+					mem->guest_store_half(addr, regs[instr.rs2()]);  // H Extension fdw: route HSV.H through the shared guest-translation memory path
+				}
+				OP_END();
+
+				OP_CASE(HSV_W) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<4, false>(addr);
+					mem->guest_store_word(addr, regs[instr.rs2()]);  // H Extension fdw: route HSV.W through the shared guest-translation memory path
+				}
+				OP_END();
+
+				OP_CASE(HSV_D) {
+					if (virt)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());
+					if (u_mode() && !csrs.hstatus.reg.fields.hu)
+						RAISE_ILLEGAL_INSTRUCTION();
+					stats.inc_loadstore();
+					uxlen_t addr = regs[instr.rs1()];
+					trap_check_addr_alignment<8, false>(addr);
+					mem->guest_store_double(addr, regs[instr.rs2()]);  // H Extension fdw: route HSV.D through the shared guest-translation memory path
+				}
+				OP_END();
+
 				OP_CASE(URET) {
 					if (!csrs.misa.has_user_mode_extension())
 						RAISE_ILLEGAL_INSTRUCTION();
@@ -7012,14 +7462,20 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(SRET) {
-					if (!csrs.misa.has_supervisor_mode_extension() || (s_mode() && csrs.mstatus.reg.fields.tsr))
+					if (!csrs.misa.has_supervisor_mode_extension() || prv < SupervisorMode)
 						RAISE_ILLEGAL_INSTRUCTION();
+					if (!virt && !m_mode() && csrs.mstatus.reg.fields.tsr)
+						RAISE_ILLEGAL_INSTRUCTION();
+					if (virt && csrs.hstatus.reg.fields.vtsr)
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: VS SRET must raise virtual-instruction fault when hstatus.VTSR is set
 					return_from_trap_handler(SupervisorMode);
 					stats.inc_sret();
 				}
 				OP_END();
 
 				OP_CASE(MRET) {
+					if (!m_mode())
+						RAISE_ILLEGAL_INSTRUCTION();
 					return_from_trap_handler(MachineMode);
 					stats.inc_mret();
 				}
@@ -7091,11 +7547,25 @@ bool ISS_CT::is_invalid_csr_access(uxlen_t csr_addr, bool is_write) {
 	    csr_addr == csr::VLENB_ADDR) {
 		v_ext.requireNotOff();
 	}
-	PrivilegeLevel csr_prv = (0x300 & csr_addr) >> 8;
-	bool csr_readonly = ((0xC00 & csr_addr) >> 10) == 3;
-	bool s_invalid = (csr_prv == SupervisorMode) && !csrs.misa.has_supervisor_mode_extension();
-	bool u_invalid = (csr_prv == UserMode) && !csrs.misa.has_user_mode_extension();
-	return (is_write && csr_readonly) || (prv < csr_prv) || s_invalid || u_invalid;
+	const PrivilegeLevel csr_prv = (0x300 & csr_addr) >> 8;
+	// H Extension fdw: treat non-virtualized S-mode as HS when comparing against H/VS CSR privilege encodings.
+	const PrivilegeLevel effective_prv = (!virt && prv == SupervisorMode) ? HypervisorMode : prv;
+	const bool csr_readonly = ((0xC00 & csr_addr) >> 10) == 3;
+	const bool missing_supervisor_extension = (csr_prv == SupervisorMode) && !csrs.misa.has_supervisor_mode_extension();
+	const bool missing_user_extension = (csr_prv == UserMode) && !csrs.misa.has_user_mode_extension();
+
+	if ((is_write && csr_readonly) || missing_supervisor_extension || missing_user_extension) {
+		return true;
+	}
+
+	if (effective_prv < csr_prv) {
+		if (virt && csr_prv <= HypervisorMode) {
+			raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: VS-mode insufficient-privilege CSR accesses to S/HS-visible CSRs must raise virtual-instruction
+		}
+		return true;
+	}
+
+	return false;
 }
 
 void ISS_CT::validate_csr_counter_read_access_rights(uxlen_t addr) {
@@ -7122,6 +7592,8 @@ uxlen_t ISS_CT::get_csr_value(uxlen_t addr) {
 		case TIME_ADDR:
 		case MTIME_ADDR: {
 			uint64_t mtime = clint->update_and_get_mtime();
+			if (virt)
+				mtime += csrs.htimedelta.reg.val;  // H Extension fdw: reading time with V=1 must add htimedelta to the underlying machine time
 			csrs.time.reg.val = mtime;
 			return csrs.time.reg.val;
 		}
@@ -7141,29 +7613,142 @@ uxlen_t ISS_CT::get_csr_value(uxlen_t addr) {
 			// TODO: SD should be updated as SD=XS|FS and SD should be read-only -> update mask
 		case MSTATUS_ADDR:
 			return read(csrs.mstatus, MSTATUS_READ_MASK);
+		case MCAUSE_ADDR:
+			return csrs.mcause.reg.val;
 		case SSTATUS_ADDR:
+			if (virt && prv == SupervisorMode)
+				return read(csrs.vsstatus, VSSTATUS_READ_MASK);  // H Extension fdw: remap sstatus to vsstatus while executing in VS and keep VSSTATUS masking explicit
 			return read(csrs.mstatus, SSTATUS_READ_MASK);
+		case VSSTATUS_ADDR:
+			return read(csrs.vsstatus, VSSTATUS_READ_MASK);  // H Extension fdw: route direct vsstatus reads through an explicit VSSTATUS mask
+		case SCAUSE_ADDR:
+			if (virt && prv == SupervisorMode)
+				return csrs.vscause.reg.val;
+			break;
+		case VSCAUSE_ADDR:
+			return csrs.vscause.reg.val;
+		case SEPC_ADDR:
+			if (virt && prv == SupervisorMode)
+				return csrs.vsepc.reg.val;
+			break;
+		case STVEC_ADDR:
+			if (virt && prv == SupervisorMode)
+				return read(csrs.vstvec, MTVEC_MASK);
+			break;
+		case SSCRATCH_ADDR:
+			if (virt && prv == SupervisorMode)
+				return csrs.vsscratch.reg.val;
+			break;
+		case STVAL_ADDR:
+			if (virt && prv == SupervisorMode)
+				return csrs.vstval.reg.val;
+			break;
 		case USTATUS_ADDR:
 			return read(csrs.mstatus, USTATUS_READ_MASK);
 
 		case MIP_ADDR:
-			return read(csrs.mip, MIP_READ_MASK);
+			return read(csrs.mip, MIP_READ_MASK) | (csrs.hvip.reg.val & csr::HVIP_MASK);  // H Extension fdw: mip must expose injected VS pending bits in the architected positions
 		case SIP_ADDR:
-			return read(csrs.mip, SIP_MASK);
+			if (virt && prv == SupervisorMode)
+				return compute_vs_visible_interrupts() & compute_vs_interrupt_pending_read_mask();  // H Extension fdw: expose only architecturally visible VS interrupt-pending bits through sip while executing in VS
+			return read(csrs.mip, compute_hs_interrupt_pending_read_mask());  // H Extension fdw: keep non-visible HS interrupt-pending bits read-only zero in sip
+		case VSIP_ADDR:
+			return compute_vs_visible_interrupts() & compute_vs_interrupt_pending_read_mask();  // H Extension fdw: report only the effective VS pending bits that are architecturally visible
+		case HIP_ADDR:
+			return (read(csrs.mip, MIP_READ_MASK) | (csrs.hvip.reg.val & csr::HVIP_MASK)) & 0x1444;  // H Extension fdw: hip is the HS-visible pending subset sourced from mip plus injected VS pending bits
 		case UIP_ADDR:
 			return read(csrs.mip, UIP_MASK);
 
 		case MIE_ADDR:
 			return read(csrs.mie, MIE_MASK);
 		case SIE_ADDR:
-			return read(csrs.mie, SIE_MASK);
+			if (virt && prv == SupervisorMode)
+				return compute_vs_visible_interrupt_enables() & compute_vs_interrupt_enable_mask();  // H Extension fdw: expose the effective VS interrupt-enable view through sie while executing in VS, including delegated alias bits from mie
+			return read(csrs.mie, compute_hs_interrupt_enable_mask());  // H Extension fdw: keep non-delegated S interrupt-enable bits read-only zero in sie
+		case VSIE_ADDR:
+			return compute_vs_visible_interrupt_enables();  // H Extension fdw: vsie must alias delegated enable bits out of mie and retain any explicit VS-only state in the VS view
+		case HIE_ADDR:
+			return read(csrs.mie, 0x1444);  // H Extension fdw: hie is the HS-visible interrupt-enable subset of mie
 		case UIE_ADDR:
 			return read(csrs.mie, UIE_MASK);
 
 		case SATP_ADDR:
+			if (virt && prv == SupervisorMode)
+				return read(csrs.vsatp, SATP_MASK);
 			if (csrs.mstatus.reg.fields.tvm)
 				RAISE_ILLEGAL_INSTRUCTION();
 			break;
+		case STIMECMP_ADDR:
+			if (!(csrs.menvcfg.reg.val & MENVCFG_STCE))
+				RAISE_ILLEGAL_INSTRUCTION();
+			if (virt && prv == SupervisorMode) {
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				if (!(csrs.henvcfg.reg.val & HENVCFG_STCE))
+					raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: VS-visible stimecmp accesses must raise virtual-instruction when henvcfg.STCE blocks the alias
+				return csrs.vstimecmp.reg.val;  // H Extension fdw: route stimecmp reads to vstimecmp while executing in VS, matching the virtualized CSR view
+			}
+			return csrs.stimecmp.reg.val;  // H Extension fdw: expose the real S-mode timer compare register once menvcfg.STCE enables Sstc
+		case VSATP_ADDR:
+			return read(csrs.vsatp, SATP_MASK);
+		case VSTIMECMP_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			if (!(csrs.menvcfg.reg.val & MENVCFG_STCE))
+				RAISE_ILLEGAL_INSTRUCTION();
+			if (!(csrs.henvcfg.reg.val & HENVCFG_STCE))
+				raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: direct vstimecmp accesses must fault when the hypervisor withholds VS timer compare visibility
+			return csrs.vstimecmp.reg.val;  // H Extension fdw: expose the VS timer compare register explicitly once both STCE gates are enabled
+
+		case HSTATUS_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return read(csrs.hstatus, HSTATUS_READ_MASK);  // H Extension fdw: route hstatus accesses through an explicit mask instead of default CSR storage
+		case HGATP_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return read(csrs.hgatp, HGATP_MASK);  // H Extension fdw: expose only architecturally visible HGATP fields
+		case HTVAL_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.htval.reg.val;  // H Extension fdw: expose HTVAL as an explicit full-width trap auxiliary CSR
+		case HTINST_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.htinst.reg.val;  // H Extension fdw: expose HTINST as an explicit full-width trap auxiliary CSR
+		case HVIP_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return (csrs.hvip.reg.val & (csr::HVIP_MASK & ~0x4)) | (csrs.mip.reg.val & 0x4);  // H Extension fdw: hvip.VSSIP aliases mip.VSSIP while VSTIP/VSEIP remain in explicit HVIP storage
+		case HVIEN_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return read(csrs.hvien, HVIEN_MASK);  // H Extension fdw: expose only the VS-interrupt subset of HVIEN used by the current virtual interrupt path
+		case HENVCFG_ADDR: {
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			const uxlen_t mask = HENVCFG_BASE_MASK | (csrs.menvcfg.reg.val & HENVCFG_GATED_MASK);
+			return csrs.henvcfg.reg.val & mask;  // H Extension fdw: expose only the henvcfg bits enabled by the local model and higher-level menvcfg policy
+		}
+		case HTIMEDELTA_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.htimedelta.reg.val;  // H Extension fdw: expose htimedelta as an explicit full-width virtual time offset CSR
+		case HGEIE_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.hgeie.reg.val & ~uxlen_t(1);  // H Extension fdw: hgeie[0] is architecturally read-only zero
+		case HGEIP_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.hgeip.reg.val & ~uxlen_t(1);  // H Extension fdw: hgeip[0] is architecturally read-only zero
+
+		case HEDELEG_ADDR:
+			return read(csrs.hedeleg, HEDELEG_MASK);
+		case HIDELEG_ADDR:
+			return (read(csrs.hideleg, HIDELEG_MASK) << 1);  // H Extension fdw: hideleg is stored in the internal VS-view bit positions, but the architectural CSR exposes VS interrupt bits in the shifted physical positions
+		case MIDELEG_ADDR:
+			return read(csrs.mideleg, MIDELEG_MASK) | 0x1444;  // H Extension fdw: mideleg hardwires VSEIP/VSSIP/VSTIP/SGEIP to one when H is implemented
 
 		case FCSR_ADDR:
 			return read(csrs.fcsr, FCSR_MASK);
@@ -7179,6 +7764,14 @@ uxlen_t ISS_CT::get_csr_value(uxlen_t addr) {
 			csrs.vcsr.reg.fields.vxrm = csrs.vxrm.reg.fields.vxrm;
 			csrs.vcsr.reg.fields.vxsat = csrs.vxsat.reg.fields.vxsat;
 			return csrs.vcsr.reg.val;
+		case MTVAL2_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.mtval2.reg.val;  // H Extension fdw: expose MTVAL2 as an explicit full-width trap auxiliary CSR
+		case MTINST_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			return csrs.mtinst.reg.val;  // H Extension fdw: expose MTINST as an explicit full-width trap auxiliary CSR
 	}
 
 	if (!csrs.is_valid_csr64_addr(addr))
@@ -7198,21 +7791,129 @@ void ISS_CT::set_csr_value(uxlen_t addr, uxlen_t value) {
 			break;
 
 		case SATP_ADDR: {
+			if (virt && prv == SupervisorMode) {
+				auto mode = csrs.vsatp.reg.fields.mode;
+				write(csrs.vsatp, SATP_MASK);
+				if (csrs.vsatp.reg.fields.mode != SATP_MODE_BARE && csrs.vsatp.reg.fields.mode != SATP_MODE_SV39 &&
+				    csrs.vsatp.reg.fields.mode != SATP_MODE_SV48 && csrs.vsatp.reg.fields.mode != SATP_MODE_SV57)
+					csrs.vsatp.reg.fields.mode = mode;
+				break;
+			}
 			if (csrs.mstatus.reg.fields.tvm)
 				RAISE_ILLEGAL_INSTRUCTION();
 			auto mode = csrs.satp.reg.fields.mode;
 			write(csrs.satp, SATP_MASK);
 			if (csrs.satp.reg.fields.mode != SATP_MODE_BARE && csrs.satp.reg.fields.mode != SATP_MODE_SV39 &&
-			    csrs.satp.reg.fields.mode != SATP_MODE_SV48)
+			    csrs.satp.reg.fields.mode != SATP_MODE_SV48 &&
+			    csrs.satp.reg.fields.mode != SATP_MODE_SV57)
 				csrs.satp.reg.fields.mode = mode;
 			// std::cout << "[iss] satp=" << boost::format("%x") % csrs.satp.reg << std::endl;
 		} break;
+			case STIMECMP_ADDR:
+				if (!(csrs.menvcfg.reg.val & MENVCFG_STCE))
+					RAISE_ILLEGAL_INSTRUCTION();
+				if (virt && prv == SupervisorMode) {
+					if (!csrs.misa.has_hypervisor_extension())
+						RAISE_ILLEGAL_INSTRUCTION();
+					if (!(csrs.henvcfg.reg.val & HENVCFG_STCE))
+						raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: VS-visible stimecmp writes must raise virtual-instruction when henvcfg.STCE blocks the alias
+					csrs.vstimecmp.reg.val = value;  // H Extension fdw: route stimecmp writes to vstimecmp while executing in VS so the alias is architecturally real
+					break;
+				}
+				csrs.stimecmp.reg.val = value;  // H Extension fdw: keep stimecmp as an explicitly writable CSR once menvcfg.STCE enables Sstc
+				break;
+			case VSATP_ADDR: {
+				auto mode = csrs.vsatp.reg.fields.mode;
+				write(csrs.vsatp, SATP_MASK);
+				if (csrs.vsatp.reg.fields.mode != SATP_MODE_BARE && csrs.vsatp.reg.fields.mode != SATP_MODE_SV39 &&
+				    csrs.vsatp.reg.fields.mode != SATP_MODE_SV48 && csrs.vsatp.reg.fields.mode != SATP_MODE_SV57)
+					csrs.vsatp.reg.fields.mode = mode;
+			} break;
+			case VSTIMECMP_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				if (!(csrs.menvcfg.reg.val & MENVCFG_STCE))
+					RAISE_ILLEGAL_INSTRUCTION();
+				if (!(csrs.henvcfg.reg.val & HENVCFG_STCE))
+					raise_trap(EXC_VIRT_INSTRUCTION_FAULT, instr.data());  // H Extension fdw: direct vstimecmp writes must fault when the hypervisor withholds VS timer compare visibility
+				csrs.vstimecmp.reg.val = value;  // H Extension fdw: keep vstimecmp as an explicitly writable VS timer compare CSR once both STCE gates are enabled
+				break;
+
+			case HSTATUS_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				write(csrs.hstatus, HSTATUS_WRITE_MASK);  // H Extension fdw: keep hstatus writes explicit so hardwired VSXL and reserved bits are preserved
+				if (csrs.hstatus.reg.fields.hupmm == 1)
+					csrs.hstatus.reg.fields.hupmm = 0;  // H Extension fdw: collapse the reserved HUPMM encoding to zero until pointer-masking support is implemented
+				break;
+			case HGATP_ADDR: {
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				auto mode = csrs.hgatp.reg.fields.mode;
+				write(csrs.hgatp, HGATP_MASK);  // H Extension fdw: keep HGATP writes explicit so reserved bits stay masked and mode can be WARL-filtered
+				if (csrs.hgatp.reg.fields.mode != HGATP_MODE_OFF && csrs.hgatp.reg.fields.mode != HGATP_MODE_SV39X4 &&
+				    csrs.hgatp.reg.fields.mode != HGATP_MODE_SV48X4)
+					csrs.hgatp.reg.fields.mode = mode;  // H Extension fdw: preserve previous HGATP mode if software writes an unsupported encoding
+				break;
+			}
+			case HTVAL_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				csrs.htval.reg.val = value;  // H Extension fdw: keep HTVAL as an explicit full-width writable CSR for trap debugging and emulation state
+				break;
+			case HTINST_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				csrs.htinst.reg.val = value;  // H Extension fdw: keep HTINST as an explicit full-width writable CSR for trap debugging and emulation state
+				break;
+			case HVIP_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				csrs.mip.reg.val = (csrs.mip.reg.val & ~0x4) | (value & 0x4);  // H Extension fdw: hvip.VSSIP aliases mip.VSSIP on writes
+				csrs.hvip.reg.val = (csrs.hvip.reg.val & ~(csr::HVIP_MASK & ~0x4)) | (value & (csr::HVIP_MASK & ~0x4));  // H Extension fdw: keep VSTIP/VSEIP in explicit HVIP storage while preserving the VSSIP alias semantics
+				break;
+			case HVIEN_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				write(csrs.hvien, HVIEN_MASK);  // H Extension fdw: keep HVIEN writes explicit so only the VS interrupt subset participates in injection
+				break;
+			case HENVCFG_ADDR: {
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				const uxlen_t mask = HENVCFG_BASE_MASK | (csrs.menvcfg.reg.val & HENVCFG_GATED_MASK);
+				csrs.henvcfg.reg.val = (csrs.henvcfg.reg.val & ~mask) | (value & mask);  // H Extension fdw: constrain henvcfg writes to locally modeled bits and menvcfg-gated capabilities
+				break;
+			}
+			case HTIMEDELTA_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				csrs.htimedelta.reg.val = value;  // H Extension fdw: keep htimedelta as an explicit full-width writable virtual time offset CSR
+				break;
+			case HGEIE_ADDR:
+				if (!csrs.misa.has_hypervisor_extension())
+					RAISE_ILLEGAL_INSTRUCTION();
+				csrs.hgeie.reg.val = value & ~uxlen_t(1);  // H Extension fdw: keep hgeie[0] read-only zero while leaving the implementation-defined GEILEN-controlled bits writable
+				break;
+
+			case HEDELEG_ADDR:
+				write(csrs.hedeleg, HEDELEG_MASK);
+				break;
+			case HIDELEG_ADDR:
+				csrs.hideleg.reg.val = (csrs.hideleg.reg.val & ~HIDELEG_MASK) | ((value >> 1) & HIDELEG_MASK);  // H Extension fdw: map architectural hideleg VS interrupt bit positions back into the internal VS-view storage
+			break;
 
 		case MTVEC_ADDR:
 			write(csrs.mtvec, MTVEC_MASK);
 			break;
 		case STVEC_ADDR:
+			if (virt && prv == SupervisorMode) {
+				write(csrs.vstvec, MTVEC_MASK);
+				break;
+			}
 			write(csrs.stvec, MTVEC_MASK);
+			break;
+		case VSTVEC_ADDR:
+			write(csrs.vstvec, MTVEC_MASK);
 			break;
 		case UTVEC_ADDR:
 			write(csrs.utvec, MTVEC_MASK);
@@ -7222,7 +7923,14 @@ void ISS_CT::set_csr_value(uxlen_t addr, uxlen_t value) {
 			write(csrs.mepc, pc_alignment_mask());
 			break;
 		case SEPC_ADDR:
+			if (virt && prv == SupervisorMode) {
+				write(csrs.vsepc, pc_alignment_mask());
+				break;
+			}
 			write(csrs.sepc, pc_alignment_mask());
+			break;
+		case VSEPC_ADDR:
+			write(csrs.vsepc, pc_alignment_mask());
 			break;
 		case UEPC_ADDR:
 			write(csrs.uepc, pc_alignment_mask());
@@ -7232,7 +7940,38 @@ void ISS_CT::set_csr_value(uxlen_t addr, uxlen_t value) {
 			write(csrs.mstatus, MSTATUS_WRITE_MASK);
 			break;
 		case SSTATUS_ADDR:
+			if (virt && prv == SupervisorMode) {
+				write(csrs.vsstatus, VSSTATUS_WRITE_MASK);  // H Extension fdw: remap sstatus writes to vsstatus while executing in VS and keep VSSTATUS masking explicit
+				break;
+			}
 			write(csrs.mstatus, SSTATUS_WRITE_MASK);
+			break;
+		case VSSTATUS_ADDR:
+			write(csrs.vsstatus, VSSTATUS_WRITE_MASK);  // H Extension fdw: route direct vsstatus writes through an explicit VSSTATUS mask
+			break;
+		case SCAUSE_ADDR:
+			if (virt && prv == SupervisorMode) {
+				csrs.vscause.reg.val = value;
+				break;
+			}
+			csrs.scause.reg.val = value;
+			break;
+		case VSCAUSE_ADDR:
+			csrs.vscause.reg.val = value;
+			break;
+		case SSCRATCH_ADDR:
+			if (virt && prv == SupervisorMode) {
+				csrs.vsscratch.reg.val = value;
+				break;
+			}
+			csrs.sscratch.reg.val = value;
+			break;
+		case STVAL_ADDR:
+			if (virt && prv == SupervisorMode) {
+				csrs.vstval.reg.val = value;
+				break;
+			}
+			csrs.stval.reg.val = value;
 			break;
 		case USTATUS_ADDR:
 			write(csrs.mstatus, USTATUS_WRITE_MASK);
@@ -7242,7 +7981,19 @@ void ISS_CT::set_csr_value(uxlen_t addr, uxlen_t value) {
 			write(csrs.mip, MIP_WRITE_MASK);
 			break;
 		case SIP_ADDR:
-			write(csrs.mip, SIP_MASK);
+			if (virt && prv == SupervisorMode) {
+				write(csrs.vsip, compute_vs_interrupt_pending_write_mask());  // H Extension fdw: route sip writes only to the writable VS software-pending subset while executing in VS
+				break;
+			}
+			write(csrs.mip, compute_hs_interrupt_pending_write_mask());  // H Extension fdw: only delegated HS software-pending bits are writable through sip
+			break;
+		case VSIP_ADDR:
+			csrs.mip.reg.val = (csrs.mip.reg.val & ~0x4) | ((((value & csrs.hideleg.reg.val & csr::SIP_MASK) << 1) & 0x4));  // H Extension fdw: delegated vsip software-pending writes alias mip.VSSIP in the architected shifted position
+			csrs.vsip.reg.val = (csrs.vsip.reg.val & ~((((csrs.hvien.reg.val >> 1) & ~csrs.hideleg.reg.val) & csr::SIP_MASK))) |
+			                    (value & (((csrs.hvien.reg.val >> 1) & ~csrs.hideleg.reg.val) & csr::SIP_MASK));  // H Extension fdw: preserve only non-delegated injected-visible VS software-pending state in the explicit VS view
+			break;
+		case HIP_ADDR:
+			csrs.mip.reg.val = (csrs.mip.reg.val & ~0x4) | (value & 0x4);  // H Extension fdw: hip writes only the architecturally writable VSSIP alias in mip
 			break;
 		case UIP_ADDR:
 			write(csrs.mip, UIP_MASK);
@@ -7252,7 +8003,20 @@ void ISS_CT::set_csr_value(uxlen_t addr, uxlen_t value) {
 			write(csrs.mie, MIE_MASK);
 			break;
 		case SIE_ADDR:
-			write(csrs.mie, SIE_MASK);
+			if (virt && prv == SupervisorMode) {
+				write(csrs.vsie, compute_vs_interrupt_enable_mask());  // H Extension fdw: route sie writes to the writable VS interrupt-enable subset while executing in VS
+				break;
+			}
+			write(csrs.mie, compute_hs_interrupt_enable_mask());  // H Extension fdw: only delegated HS interrupt-enable bits are writable through sie
+			break;
+		case VSIE_ADDR:
+			csrs.mie.reg.val = (csrs.mie.reg.val & ~((csrs.hideleg.reg.val & csr::SIE_MASK) << 1)) |
+			                   ((value & csrs.hideleg.reg.val & csr::SIE_MASK) << 1);  // H Extension fdw: delegated vsie writes alias into mie at the architected VS interrupt-enable positions
+			csrs.vsie.reg.val = (csrs.vsie.reg.val & ~((((csrs.hvien.reg.val >> 1) & ~csrs.hideleg.reg.val) & csr::SIE_MASK))) |
+			                    (value & (((csrs.hvien.reg.val >> 1) & ~csrs.hideleg.reg.val) & csr::SIE_MASK));  // H Extension fdw: retain any non-delegated injected-visible VS enable bits in the explicit VS view
+			break;
+		case HIE_ADDR:
+			csrs.mie.reg.val = (csrs.mie.reg.val & ~0x1444) | (value & 0x1444);  // H Extension fdw: hie writes alias the HS-visible virtual interrupt-enable subset of mie
 			break;
 		case UIE_ADDR:
 			write(csrs.mie, UIE_MASK);
@@ -7260,10 +8024,21 @@ void ISS_CT::set_csr_value(uxlen_t addr, uxlen_t value) {
 
 		case MIDELEG_ADDR:
 			write(csrs.mideleg, MIDELEG_MASK);
+			csrs.mideleg.reg.val |= 0x1444;  // H Extension fdw: preserve the architecturally forced HS interrupt delegation bits as read-only one
 			break;
 
 		case MEDELEG_ADDR:
 			write(csrs.medeleg, MEDELEG_MASK);
+			break;
+		case MTVAL2_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			csrs.mtval2.reg.val = value;  // H Extension fdw: keep MTVAL2 as an explicit full-width writable CSR for trap debugging and emulation state
+			break;
+		case MTINST_ADDR:
+			if (!csrs.misa.has_hypervisor_extension())
+				RAISE_ILLEGAL_INSTRUCTION();
+			csrs.mtinst.reg.val = value;  // H Extension fdw: keep MTINST as an explicit full-width writable CSR for trap debugging and emulation state
 			break;
 
 		case SIDELEG_ADDR:
@@ -7444,12 +8219,24 @@ void ISS_CT::fp_require_not_off() {
 }
 
 void ISS_CT::return_from_trap_handler(PrivilegeLevel return_mode) {
+	constexpr uxlen_t STATUS_SIE = uxlen_t(1) << 1;    // H Extension fdw: shared S/VS interrupt-enable bit position
+	constexpr uxlen_t STATUS_SPIE = uxlen_t(1) << 5;   // H Extension fdw: shared S/VS previous interrupt-enable bit position
+	constexpr uxlen_t STATUS_SPP = uxlen_t(1) << 8;    // H Extension fdw: shared S/VS previous privilege bit position
+	const auto require_aligned_retpc = [this](uxlen_t retpc) {
+		if ((retpc & ~pc_alignment_mask()) != 0) {
+			raise_trap(EXC_INSTR_ADDR_MISALIGNED, retpc);  // H Extension fdw: xRET must fault before state changes when the return PC is misaligned
+		}
+	};
+
 	switch (return_mode) {
 		case MachineMode:
+			require_aligned_retpc(csrs.mepc.reg.val);
 			prv = csrs.mstatus.reg.fields.mpp;
+			virt = ((csrs.mstatus.reg.val & csr::MSTATUS_MPV) != 0) && (prv != MachineMode);  // H Extension fdw: MPV only re-enables virtualization when MRET leaves M-mode
 			csrs.mstatus.reg.fields.mie = csrs.mstatus.reg.fields.mpie;
 			csrs.mstatus.reg.fields.mpie = 1;
 			pc = csrs.mepc.reg.val;
+			csrs.mstatus.reg.val &= ~csr::MSTATUS_MPV;
 			if (csrs.misa.has_user_mode_extension())
 				csrs.mstatus.reg.fields.mpp = UserMode;
 			else
@@ -7457,18 +8244,38 @@ void ISS_CT::return_from_trap_handler(PrivilegeLevel return_mode) {
 			break;
 
 		case SupervisorMode:
-			prv = csrs.mstatus.reg.fields.spp;
-			csrs.mstatus.reg.fields.sie = csrs.mstatus.reg.fields.spie;
-			csrs.mstatus.reg.fields.spie = 1;
-			pc = csrs.sepc.reg.val;
-			if (csrs.misa.has_user_mode_extension())
-				csrs.mstatus.reg.fields.spp = UserMode;
-			else
-				csrs.mstatus.reg.fields.spp = SupervisorMode;
+			if (virt) {
+				require_aligned_retpc(csrs.vsepc.reg.val);
+				// H Extension fdw: VS SRET consumes vsstatus/vsepc and stays in virtualized privilege space.
+				prv = (csrs.vsstatus.reg.val & STATUS_SPP) ? SupervisorMode : UserMode;
+				csrs.vsstatus.reg.val = (csrs.vsstatus.reg.val & ~STATUS_SIE) |
+				                        ((csrs.vsstatus.reg.val & STATUS_SPIE) ? STATUS_SIE : 0);
+				csrs.vsstatus.reg.val |= STATUS_SPIE;
+				if (csrs.misa.has_user_mode_extension())
+					csrs.vsstatus.reg.val &= ~STATUS_SPP;
+				else
+					csrs.vsstatus.reg.val |= STATUS_SPP;
+				pc = csrs.vsepc.reg.val;
+				virt = true;
+			} else {
+				require_aligned_retpc(csrs.sepc.reg.val);
+				// H Extension fdw: HS SRET consumes hstatus.SPV and returns through HS-owned sepc.
+				prv = csrs.mstatus.reg.fields.spp;
+				virt = (csrs.hstatus.reg.val & csr::HSTATUS_SPV) != 0;
+				csrs.hstatus.reg.val &= ~csr::HSTATUS_SPV;
+				csrs.mstatus.reg.fields.sie = csrs.mstatus.reg.fields.spie;
+				csrs.mstatus.reg.fields.spie = 1;
+				pc = csrs.sepc.reg.val;
+				if (csrs.misa.has_user_mode_extension())
+					csrs.mstatus.reg.fields.spp = UserMode;
+				else
+					csrs.mstatus.reg.fields.spp = SupervisorMode;
+			}
 			break;
 
 		case UserMode:
 			prv = UserMode;
+			virt = false;
 			csrs.mstatus.reg.fields.uie = csrs.mstatus.reg.fields.upie;
 			csrs.mstatus.reg.fields.upie = 1;
 			pc = csrs.uepc.reg.val;
@@ -7565,10 +8372,44 @@ std::string ISS_CT::name() {
 }
 
 PrivilegeLevel ISS_CT::prepare_trap(SimulationTrap &e, uxlen_t last_pc) {
+	const auto trap_reason_has_guest_address = [](ExceptionCode reason) {
+		switch (reason) {
+			case EXC_INSTR_ADDR_MISALIGNED:
+			case EXC_INSTR_ACCESS_FAULT:
+			case EXC_INSTR_PAGE_FAULT:
+			case EXC_LOAD_ADDR_MISALIGNED:
+			case EXC_LOAD_ACCESS_FAULT:
+			case EXC_LOAD_PAGE_FAULT:
+			case EXC_STORE_AMO_ADDR_MISALIGNED:
+			case EXC_STORE_AMO_ACCESS_FAULT:
+			case EXC_STORE_AMO_PAGE_FAULT:
+				return true;
+			default:
+				return false;
+		}
+	};
+
 	// undo any potential pc update (for traps the pc should point to the originating instruction and not it's
 	// successor)
 	pc = last_pc;
+	trap_to_virtual_supervisor = false;
 	unsigned exc_bit = (1 << e.reason);
+	if (!e.write_gva && virt && trap_reason_has_guest_address(e.reason)) {
+		e.write_gva = true;  // H Extension fdw: virtualized address-like traps should mark GVA when no richer MMU metadata exists
+	}
+	if (!e.tval2 && e.write_gva) {
+		e.tval2 = e.mtval;  // H Extension fdw: use the reported fault address as a temporary second trap value until guest physical fault data is available
+	}
+
+	if (virt && prv <= SupervisorMode && (exc_bit & csrs.medeleg.reg.val) && (exc_bit & csrs.hedeleg.reg.val)) {
+		// H Extension fdw: delegated virtualized traps stay in VS and use the VS trap CSRs.
+		csrs.vscause.reg.fields.interrupt = 0;
+		csrs.vscause.reg.fields.exception_code = e.reason;
+		csrs.vsepc.reg.val = pc;
+		csrs.vstval.reg.val = e.mtval;
+		trap_to_virtual_supervisor = true;
+		return SupervisorMode;
+	}
 
 	// 1) machine mode execution takes any traps, independent of delegation setting
 	// 2) non-delegated traps are processed in machine mode, independent of current execution mode
@@ -7577,6 +8418,14 @@ PrivilegeLevel ISS_CT::prepare_trap(SimulationTrap &e, uxlen_t last_pc) {
 		csrs.mcause.reg.fields.exception_code = e.reason;
 		csrs.mtval.reg.val = e.mtval;
 		return MachineMode;
+	}
+
+	if (virt) {
+		// H Extension fdw: non-VS traps taken while V=1 always land in HS once M-mode delegation allows them.
+		csrs.scause.reg.fields.interrupt = 0;
+		csrs.scause.reg.fields.exception_code = e.reason;
+		csrs.stval.reg.val = e.mtval;
+		return SupervisorMode;
 	}
 
 	// see above machine mode comment
@@ -7601,6 +8450,8 @@ void ISS_CT::prepare_interrupt(const PendingInterrupts &e) {
 	}
 
 	csr_mip x{e.pending};
+	trap_to_virtual_supervisor = false;
+	const bool has_virtual_supervisor_source = (e.source_pending & csr::HVIP_MASK) != 0;
 
 	ExceptionCode exc;
 	if (x.reg.fields.meip)
@@ -7624,6 +8475,18 @@ void ISS_CT::prepare_interrupt(const PendingInterrupts &e) {
 	else
 		throw std::runtime_error("some pending interrupt must be available here");
 
+	if (e.target_mode == SupervisorMode) {
+		// H Extension fdw: delegated timer/software/external interrupts retain the
+		// physical pending source in mip/hvip, but HS/VS trap handlers must observe
+		// supervisor-level interrupt causes.
+		if (exc == EXC_M_EXTERNAL_INTERRUPT)
+			exc = EXC_S_EXTERNAL_INTERRUPT;
+		else if (exc == EXC_M_SOFTWARE_INTERRUPT)
+			exc = EXC_S_SOFTWARE_INTERRUPT;
+		else if (exc == EXC_M_TIMER_INTERRUPT)
+			exc = EXC_S_TIMER_INTERRUPT;
+	}
+
 	switch (e.target_mode) {
 		case MachineMode:
 			csrs.mcause.reg.fields.exception_code = exc;
@@ -7631,8 +8494,24 @@ void ISS_CT::prepare_interrupt(const PendingInterrupts &e) {
 			break;
 
 		case SupervisorMode:
-			csrs.scause.reg.fields.exception_code = exc;
-			csrs.scause.reg.fields.interrupt = 1;
+			if (virt && (e.pending & compute_vs_visible_interrupts())) {
+				// H Extension fdw: delegated virtual interrupts target VS instead of HS.
+				csrs.vscause.reg.fields.exception_code = exc;
+				csrs.vscause.reg.fields.interrupt = 1;
+				trap_to_virtual_supervisor = true;
+			} else {
+				if (has_virtual_supervisor_source) {
+					// H Extension fdw: HS must report legacy VSSIP/VSTIP/VSEIP sources using the virtual-supervisor interrupt cause encodings rather than collapsing them into ordinary supervisor interrupts.
+					if (e.source_pending & 0x400)
+						exc = EXC_VS_EXTERNAL_INTERRUPT;
+					else if (e.source_pending & 0x4)
+						exc = EXC_VS_SOFTWARE_INTERRUPT;
+					else if (e.source_pending & 0x40)
+						exc = EXC_VS_TIMER_INTERRUPT;
+				}
+				csrs.scause.reg.fields.exception_code = exc;
+				csrs.scause.reg.fields.interrupt = 1;
+			}
 			break;
 
 		case UserMode:
@@ -7645,51 +8524,196 @@ void ISS_CT::prepare_interrupt(const PendingInterrupts &e) {
 	}
 }
 
+#ifndef RV64_VS_LEGACY_INTERRUPT_HELPERS
+#define RV64_VS_LEGACY_INTERRUPT_HELPERS
+static inline uxlen_t normalize_vs_legacy_interrupt_bits(uxlen_t pending) {
+	// H Extension fdw: VP++ keeps VSSIP/VSTIP/VSEIP pending sources in raw mip/hvip positions, but lower-level routing and cause selection must see them in the supervisor-style bit positions.
+	constexpr uxlen_t vs_legacy_raw_mask = csr::HVIP_MASK;
+	return (pending & ~vs_legacy_raw_mask) | ((pending & vs_legacy_raw_mask) >> 1);
+}
+
+static inline uxlen_t expand_vs_legacy_interrupt_bits(uxlen_t pending) {
+	// H Extension fdw: hideleg is stored in internal VS-view positions, so interrupt-routing decisions against raw mip/hvip state need the architected shifted positions.
+	return (pending << 1) & csr::HVIP_MASK;
+}
+
+static inline uxlen_t effective_mideleg_bits(uxlen_t mideleg) {
+	// H Extension fdw: VSSIP/VSTIP/VSEIP/SGEIP are architecturally read-only one in mideleg when H is implemented, so interrupt routing must observe them even if software never writes mideleg.
+	return mideleg | uxlen_t(0x1444);
+}
+#endif
+
+uxlen_t ISS_CT::compute_hs_interrupt_enable_mask() {
+	// H Extension fdw: without AIA/mvien support, HS-visible sie bits track only S interrupts delegated from M.
+	return effective_mideleg_bits(csrs.mideleg.reg.val) & csr::SIE_MASK;
+}
+
+uxlen_t ISS_CT::compute_hs_interrupt_pending_read_mask() {
+	// H Extension fdw: sip exposes the delegated HS interrupt-pending view, but non-delegated bits stay read-only zero.
+	return effective_mideleg_bits(csrs.mideleg.reg.val) & csr::SIE_MASK;
+}
+
+uxlen_t ISS_CT::compute_hs_interrupt_pending_write_mask() {
+	// H Extension fdw: without mvip/mvien, only delegated HS software-pending bits are writable through sip.
+	return effective_mideleg_bits(csrs.mideleg.reg.val) & csr::SIP_MASK;
+}
+
+uxlen_t ISS_CT::compute_vs_interrupt_enable_mask() {
+	// H Extension fdw: VS-visible sie bits exist only for interrupts delegated to VS or explicitly injected through HVIEN.
+	return (csrs.hideleg.reg.val | csrs.hvien.reg.val) & csr::SIE_MASK;
+}
+
+uxlen_t ISS_CT::compute_vs_visible_interrupt_enables() {
+	// H Extension fdw: delegated VS interrupt enables alias out of mie, while any non-delegated injected-visible enables stay in the explicit vsie storage.
+	return (((csrs.mie.reg.val >> 1) & csrs.hideleg.reg.val & csr::SIE_MASK) |
+	        (csrs.vsie.reg.val & (((csrs.hvien.reg.val >> 1) & ~csrs.hideleg.reg.val) & csr::SIE_MASK)));
+}
+
+uxlen_t ISS_CT::compute_vs_interrupt_pending_read_mask() {
+	// H Extension fdw: vsip exposes the delegated-or-injected VS interrupt-pending view, but invisible bits stay read-only zero.
+	return (csrs.hideleg.reg.val | csrs.hvien.reg.val) & csr::SIE_MASK;
+}
+
+uxlen_t ISS_CT::compute_vs_interrupt_pending_write_mask() {
+	// H Extension fdw: without full AIA support, direct VS pending writes only model delegated software-pending bits.
+	return csrs.hideleg.reg.val & csr::SIP_MASK;
+}
+
+uxlen_t ISS_CT::compute_vs_visible_interrupts() {
+	// H Extension fdw: combine delegated VS interrupts and hypervisor-injected VS interrupts after normalizing the legacy VS bit positions into the internal supervisor-style view used by VS CSRs and trap causes.
+	const uxlen_t vs_mask = compute_vs_interrupt_pending_read_mask();
+	const uxlen_t mideleg = effective_mideleg_bits(csrs.mideleg.reg.val);
+	const uxlen_t raw_hideleg = expand_vs_legacy_interrupt_bits(csrs.hideleg.reg.val);
+	const uxlen_t delegated_vs_pending =
+	    normalize_vs_legacy_interrupt_bits(csrs.mip.reg.val & csrs.mie.reg.val & mideleg & raw_hideleg) &
+	    vs_mask;
+	const uxlen_t raw_hvip = (csrs.hvip.reg.val & (csr::HVIP_MASK & ~uxlen_t(0x4))) | (csrs.mip.reg.val & 0x4);
+	const uxlen_t injected_vs_pending = normalize_vs_legacy_interrupt_bits(raw_hvip) & vs_mask;
+	const uxlen_t software_vs_pending = csrs.vsip.reg.val & vs_mask;
+	return delegated_vs_pending | injected_vs_pending | software_vs_pending;
+}
+
 PendingInterrupts ISS_CT::compute_pending_interrupts() {
 	uxlen_t pending = csrs.mie.reg.val & csrs.mip.reg.val;
+	uxlen_t vs_pending = 0;
+	bool vs_enabled = false;
+	const uxlen_t raw_vs_legacy_mask = csr::HVIP_MASK;
+	const uxlen_t mideleg = effective_mideleg_bits(csrs.mideleg.reg.val);
 
-	if (!pending)
-		return {NoneMode, 0};
-
-	auto m_pending = pending & ~csrs.mideleg.reg.val;
-	if (m_pending && (prv < MachineMode || (prv == MachineMode && csrs.mstatus.reg.fields.mie))) {
-		return {MachineMode, m_pending};
+	if (virt) {
+		// H Extension fdw: injected VS interrupts may be pending even when mip/mie has no active S-level source.
+		vs_pending = compute_vs_visible_interrupts() & compute_vs_visible_interrupt_enables();
+		vs_enabled = (prv < SupervisorMode) || (prv == SupervisorMode && ((csrs.vsstatus.reg.val >> 1) & 0x1));
 	}
 
-	pending = pending & csrs.mideleg.reg.val;
+	if (!pending && !(vs_pending && vs_enabled))
+		return {NoneMode, 0, 0};
+
+	auto m_pending = pending & ~mideleg & ~raw_vs_legacy_mask;
+	if (m_pending && (prv < MachineMode || (prv == MachineMode && csrs.mstatus.reg.fields.mie))) {
+		return {MachineMode, m_pending, m_pending};
+	}
+
+	const uxlen_t delegated_pending = pending & mideleg;
+	pending = normalize_vs_legacy_interrupt_bits(delegated_pending);
+
+	if (virt) {
+		if (vs_pending && vs_enabled) {
+			return {SupervisorMode, vs_pending, delegated_pending & expand_vs_legacy_interrupt_bits(csrs.hideleg.reg.val)};
+		}
+
+		auto hs_pending = pending & ~csrs.hideleg.reg.val;
+		const bool hs_enabled = virt || (prv < SupervisorMode) ||
+		                        (prv == SupervisorMode && csrs.mstatus.reg.fields.sie);  // H Extension fdw: while executing in VS/VU, HS interrupts remain globally enabled regardless of sstatus.SIE
+		if (hs_pending && hs_enabled) {
+			return {SupervisorMode, hs_pending, delegated_pending & ~expand_vs_legacy_interrupt_bits(csrs.hideleg.reg.val)};
+		}
+
+		return {NoneMode, 0, 0};
+	}
+
 	auto s_pending = pending & ~csrs.sideleg.reg.val;
 	if (s_pending && (prv < SupervisorMode || (prv == SupervisorMode && csrs.mstatus.reg.fields.sie))) {
-		return {SupervisorMode, s_pending};
+		return {SupervisorMode, s_pending, delegated_pending & ~csrs.sideleg.reg.val};
 	}
 
 	auto u_pending = pending & csrs.sideleg.reg.val;
 	if (u_pending && (prv == UserMode && csrs.mstatus.reg.fields.uie)) {
-		return {UserMode, u_pending};
+		return {UserMode, u_pending, delegated_pending & csrs.sideleg.reg.val};
 	}
 
-	return {NoneMode, 0};
+	return {NoneMode, 0, 0};
 }
 
-void ISS_CT::switch_to_trap_handler(PrivilegeLevel target_mode) {
+void ISS_CT::switch_to_trap_handler(PrivilegeLevel target_mode, const SimulationTrap *trap) {
 	if (trace) {
 		printf("[vp::iss] switch to trap handler, time %s, before pc %16lx, irq %u, t-prv %1x\n",
 		       quantum_keeper.get_current_time().to_string().c_str(), pc, csrs.mcause.reg.fields.interrupt,
 		       target_mode);
 	}
 
+	const auto trap_reason_has_guest_address = [](ExceptionCode reason) {
+		switch (reason) {
+			case EXC_INSTR_ADDR_MISALIGNED:
+			case EXC_INSTR_ACCESS_FAULT:
+			case EXC_INSTR_PAGE_FAULT:
+			case EXC_LOAD_ADDR_MISALIGNED:
+			case EXC_LOAD_ACCESS_FAULT:
+			case EXC_LOAD_PAGE_FAULT:
+			case EXC_STORE_AMO_ADDR_MISALIGNED:
+			case EXC_STORE_AMO_ACCESS_FAULT:
+			case EXC_STORE_AMO_PAGE_FAULT:
+				return true;
+			default:
+				return false;
+		}
+	};
+
+	const auto trap_tinst = [this, trap, &trap_reason_has_guest_address]() -> uxlen_t {
+		if (!trap) {
+			return 0;
+		}
+		if (trap->tinst) {
+			return trap->tinst;
+		}
+		// H Extension fdw: until the MMU provides architecturally-correct transformed trap instructions for
+		// generic load/store/HLV/HSV/HLVX faults, keep mtinst/htinst at zero rather than publishing raw instruction
+		// bits that can disagree with the transformed-instruction encoding expected by the tinst_* tests.
+		(void)trap_reason_has_guest_address;
+		return 0;
+	}();
+	const uxlen_t trap_tval2 = trap ? trap->tval2 : 0;
+	const bool trap_write_gva = trap && trap->write_gva;
+	constexpr uxlen_t STATUS_SIE = uxlen_t(1) << 1;    // H Extension fdw: shared S/VS interrupt-enable bit position during trap entry
+	constexpr uxlen_t STATUS_SPIE = uxlen_t(1) << 5;   // H Extension fdw: shared S/VS previous interrupt-enable bit position during trap entry
+	constexpr uxlen_t STATUS_SPP = uxlen_t(1) << 8;    // H Extension fdw: shared S/VS previous privilege bit position during trap entry
+
 	// free any potential LR/SC bus lock before processing a trap/interrupt
 	release_lr_sc_reservation();
 
 	auto pp = prv;
+	auto prev_virt = virt;
 	prv = target_mode;
 
 	switch (target_mode) {
 		case MachineMode:
 			csrs.mepc.reg.val = pc;
 
+			// H Extension fdw: M-mode trap entry snapshots virtualization state for MRET.
+			csrs.mstatus.reg.val &= ~csr::MSTATUS_GVA;
+			if (prev_virt && pp != MachineMode)
+				csrs.mstatus.reg.val |= csr::MSTATUS_MPV;
+			else
+				csrs.mstatus.reg.val &= ~csr::MSTATUS_MPV;
+			if (prev_virt && trap_write_gva)
+				csrs.mstatus.reg.val |= csr::MSTATUS_GVA;
+			csrs.mtval2.reg.val = trap_tval2;  // H Extension fdw: propagate second trap value into mtval2 for M-mode handling
+			csrs.mtinst.reg.val = trap_tinst;  // H Extension fdw: propagate transformed trap instruction into mtinst for M-mode handling
+
 			csrs.mstatus.reg.fields.mpie = csrs.mstatus.reg.fields.mie;
 			csrs.mstatus.reg.fields.mie = 0;
 			csrs.mstatus.reg.fields.mpp = pp;
+			virt = false;
 
 			pc = csrs.mtvec.get_base_address();
 
@@ -7711,22 +8735,54 @@ void ISS_CT::switch_to_trap_handler(PrivilegeLevel target_mode) {
 			break;
 
 		case SupervisorMode:
-			assert(prv == SupervisorMode || prv == UserMode);
+			if (trap_to_virtual_supervisor) {
+				// H Extension fdw: VS trap entry updates VS-owned status bits and keeps V=1.
+				csrs.vsepc.reg.val = pc;
+				csrs.vsstatus.reg.val = (csrs.vsstatus.reg.val & ~STATUS_SPIE) |
+				                        ((csrs.vsstatus.reg.val & STATUS_SIE) ? STATUS_SPIE : 0);
+				csrs.vsstatus.reg.val &= ~STATUS_SIE;
+				if (pp == SupervisorMode)
+					csrs.vsstatus.reg.val |= STATUS_SPP;
+				else
+					csrs.vsstatus.reg.val &= ~STATUS_SPP;
+				pc = csrs.vstvec.get_base_address();
+				if (csrs.vscause.reg.fields.interrupt && csrs.vstvec.reg.fields.mode == csr_mtvec::Mode::Vectored)
+					pc += 4 * csrs.vscause.reg.fields.exception_code;
+				virt = true;
+				trap_to_virtual_supervisor = false;
+			} else {
+				csrs.sepc.reg.val = pc;
+				// H Extension fdw: HS trap entry snapshots whether the trap came from VS or VU.
+				if (csrs.misa.has_hypervisor_extension()) {
+					if (prev_virt) {
+						csrs.hstatus.reg.val |= csr::HSTATUS_SPV;
+						if (pp == SupervisorMode)
+							csrs.hstatus.reg.val |= csr::HSTATUS_SPVP;
+						else
+							csrs.hstatus.reg.val &= ~csr::HSTATUS_SPVP;
+					} else {
+						csrs.hstatus.reg.val &= ~(csr::HSTATUS_SPV | csr::HSTATUS_SPVP);
+					}
+					if (prev_virt && trap_write_gva)
+						csrs.hstatus.reg.val |= csr::HSTATUS_GVA;
+					else
+						csrs.hstatus.reg.val &= ~csr::HSTATUS_GVA;
+					csrs.htval.reg.val = trap_tval2;  // H Extension fdw: propagate second trap value into htval for HS handling
+					csrs.htinst.reg.val = trap_tinst;  // H Extension fdw: propagate transformed trap instruction into htinst for HS handling
+				}
+				csrs.mstatus.reg.fields.spie = csrs.mstatus.reg.fields.sie;
+				csrs.mstatus.reg.fields.sie = 0;
+				csrs.mstatus.reg.fields.spp = pp;
+				pc = csrs.stvec.get_base_address();
 
-			csrs.sepc.reg.val = pc;
-
-			csrs.mstatus.reg.fields.spie = csrs.mstatus.reg.fields.sie;
-			csrs.mstatus.reg.fields.sie = 0;
-			csrs.mstatus.reg.fields.spp = pp;
-
-			pc = csrs.stvec.get_base_address();
-
-			if (csrs.scause.reg.fields.interrupt && csrs.stvec.reg.fields.mode == csr_mtvec::Mode::Vectored)
-				pc += 4 * csrs.scause.reg.fields.exception_code;
+				if (csrs.scause.reg.fields.interrupt && csrs.stvec.reg.fields.mode == csr_mtvec::Mode::Vectored)
+					pc += 4 * csrs.scause.reg.fields.exception_code;
+				virt = false;
+			}
 			break;
 
 		case UserMode:
-			assert(prv == UserMode);
+			assert(pp == UserMode);
 
 			csrs.uepc.reg.val = pc;
 
@@ -7744,6 +8800,7 @@ void ISS_CT::switch_to_trap_handler(PrivilegeLevel target_mode) {
 	}
 
 	dbbcache.enter_trap(pc);
+	force_slow_path();  // H Extension fdw: serialize trap-entry execution so handler CSR reads and pass/fail marker writes observe fresh architectural state immediately after trap redirection.
 }
 
 void ISS_CT::handle_interrupt() {
@@ -7755,8 +8812,66 @@ void ISS_CT::handle_interrupt() {
 }
 
 void ISS_CT::handle_trap(SimulationTrap &e, uxlen_t last_pc) {
+	const bool trap_from_guest = virt;
 	auto target_mode = prepare_trap(e, last_pc);
-	switch_to_trap_handler(target_mode);
+	log_early_boot_trap(e, target_mode, last_pc);  // H Extension fdw: preserve the earliest boot trap metadata before trap entry rewrites privilege state and PC
+	if (guest_mmio_debug && guest_mmio_debug_budget > 0 && trap_from_guest) {
+		boost::io::ios_flags_saver ifs(std::cout);
+		// H Extension fdw: keep the first guest-visible traps next to guest-MMIO logs so L2 bring-up failures can be correlated with missing UART accesses.
+		std::cout << "[vp::guest-trap] hart " << std::dec << csrs.mhartid.reg.val
+		          << " reason=" << e.reason
+		          << " last_pc=0x" << std::hex << last_pc
+		          << " mtval=0x" << e.mtval
+		          << " tval2=0x" << e.tval2
+		          << " tinst=0x" << e.tinst
+		          << " target=" << early_boot_priv_name(target_mode)
+		          << " prv=" << early_boot_priv_name(prv)
+		          << " virt=" << virt
+		          << " satp=0x" << csrs.satp.reg.val
+		          << " vsatp=0x" << csrs.vsatp.reg.val
+		          << " vsepc=0x" << csrs.vsepc.reg.val
+		          << " vscause=0x" << csrs.vscause.reg.val
+		          << " vstval=0x" << csrs.vstval.reg.val
+		          << " hgatp=0x" << csrs.hgatp.reg.val
+		          << std::dec << std::endl;
+		--guest_mmio_debug_budget;
+	}
+	switch_to_trap_handler(target_mode, &e);  // H Extension fdw: pass trap metadata so hypervisor trap CSRs receive tinst/tval2 information
+	if (guest_mmio_debug && guest_mmio_debug_budget > 0 && trap_from_guest) {
+		boost::io::ios_flags_saver ifs(std::cout);
+		// H Extension fdw: capture the trap-vector landing PC after guest-visible traps so L2 failures can be tied to a concrete handler entry instead of only the faulting PC.
+		std::cout << "[vp::guest-trap-target] hart " << std::dec << csrs.mhartid.reg.val
+		          << " pc=0x" << std::hex << pc
+		          << " prv=" << early_boot_priv_name(prv)
+		          << " virt=" << virt
+		          << " mepc=0x" << csrs.mepc.reg.val
+		          << " mcause=0x" << csrs.mcause.reg.val
+		          << " mtval=0x" << csrs.mtval.reg.val
+		          << " sepc=0x" << csrs.sepc.reg.val
+		          << " stvec=0x" << csrs.stvec.reg.val
+		          << " vsepc=0x" << csrs.vsepc.reg.val
+		          << " vscause=0x" << csrs.vscause.reg.val
+		          << " vstval=0x" << csrs.vstval.reg.val
+		          << " vstvec=0x" << csrs.vstvec.reg.val
+		          << " hstatus=0x" << csrs.hstatus.reg.val
+		          << " htval=0x" << csrs.htval.reg.val
+		          << " htinst=0x" << csrs.htinst.reg.val
+		          << std::dec << std::endl;
+		--guest_mmio_debug_budget;
+	}
+	if (early_boot_debug && early_boot_log_budget > 0) {
+		boost::io::ios_flags_saver ifs(std::cout);
+		std::cout << "[vp::earlyboot] hart " << std::dec << csrs.mhartid.reg.val
+		          << " trap-target pc=0x" << std::hex << pc
+		          << " prv=" << early_boot_priv_name(prv)
+		          << " virt=" << virt
+		          << " mepc=0x" << csrs.mepc.reg.val
+		          << " sepc=0x" << csrs.sepc.reg.val
+		          << " stvec=0x" << csrs.stvec.reg.val
+		          << " mtvec=0x" << csrs.mtvec.reg.val
+		          << std::dec << std::endl;
+		--early_boot_log_budget;
+	}
 }
 
 void ISS_CT::run_step() {

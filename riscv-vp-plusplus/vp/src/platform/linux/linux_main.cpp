@@ -17,8 +17,6 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
-#include <limits>
-#include <vector>
 
 #include "core/common/clint.h"
 #include "core/common/debug.h"
@@ -54,7 +52,7 @@
 #include "core/rv64_cheriv9/mmu.h"
 #include "core/rv64_cheriv9/syscall.h"
 #endif
- 
+
 #include "platform/common/channel_console.h"
 #include "platform/common/channel_slip.h"
 #include "platform/common/ds1307.h"
@@ -73,8 +71,6 @@
 #include "platform/common/vncsimplefb.h"
 #include "platform/common/vncsimpleinputkbd.h"
 #include "platform/common/vncsimpleinputptr.h"
-#include "ace_l2_memory_subsystem.h"
-#include "adapter.h"
 #include "prci.h"
 #include "util/options.h"
 #include "util/propertytree.h"
@@ -95,7 +91,6 @@ using namespace rv32;
 #define MRAM_SIZE_MB 64  // MB mem mapped file (rootfs)
 /* address to load raw (not elf) images provided via --kernel-file */
 #define KERNEL_LOAD_ADDR 0x80400000
-#define CACHE_ACE_RESERVED_START_ADDR KERNEL_LOAD_ADDR
 
 #elif defined(TARGET_RV64)
 using namespace rv64;
@@ -103,7 +98,6 @@ using namespace rv64;
 #define MRAM_SIZE_MB 512  // MB mem mapped file (rootfs)
 /* address to load raw (not elf) images provided via --kernel-file */
 #define KERNEL_LOAD_ADDR 0x80200000
-#define CACHE_ACE_RESERVED_START_ADDR 0xE0000000
 
 #elif defined(TARGET_RV64_CHERIV9)
 using namespace cheriv9::rv64;
@@ -111,7 +105,6 @@ using namespace cheriv9::rv64;
 #define MRAM_SIZE_MB 512  // MB mem mapped file (rootfs)
 /* address to load raw (not elf) images provided via --kernel-file */
 #define KERNEL_LOAD_ADDR 0x80200000
-#define CACHE_ACE_RESERVED_START_ADDR 0xE0000000
 
 #endif /* TARGET_RVxx */
 
@@ -177,11 +170,8 @@ struct LinuxOptions : public Options {
 	unsigned int vnc_port = 5900;
 
 	bool cheri_purecap = false;
-	/* PTE/PBMT 测试窗口：Linux 侧驱动会 mmap 这段 reserved-memory，
-	 * VP 侧让它绕过 data DMI，走 master-ace/coherent L2 路径，便于观察
-	 * PTE PBMT 属性和 PMA 属性对事务路径的影响。 */
-	addr_t cache_ace_dram_window_start = KERNEL_LOAD_ADDR;
-	addr_t cache_ace_dram_window_size = 64 * 1024;
+	bool early_boot_debug = false;
+	bool guest_mmio_debug = false;
 
 	LinuxOptions(void) {
 		// clang-format off
@@ -198,11 +188,11 @@ struct LinuxOptions : public Options {
 			("mram-data-image-size", po::value<uint64_t>(&mram_data_size), "MRAM data image size")
 			("sd-card-image", po::value<std::string>(&sd_card_image)->default_value(""), "SD-Card image file (size must be multiple of 512 bytes)")
 			("vnc-port", po::value<unsigned int>(&vnc_port), "select port number to connect with VNC")
-			("cache-ace-dram-window-start", po::value<uint64_t>(&cache_ace_dram_window_start), "DRAM window start address reserved to bypass DMI and exercise cache_ace")
-			("cache-ace-dram-window-size", po::value<uint64_t>(&cache_ace_dram_window_size), "DRAM window size reserved to bypass DMI and exercise cache_ace")
 #ifdef TARGET_RV64_CHERIV9
 			("cheri-purecap", po::bool_switch(&cheri_purecap), "start in cheri purecap mode")
 #endif
+			("early-boot-debug", po::bool_switch(&early_boot_debug), "print focused OpenSBI/Linux handoff debug markers")
+			("guest-mmio-debug", po::bool_switch(&guest_mmio_debug), "print focused guest MMIO/trap markers for the L2 UART range")
 			;
 		// clang-format on
 	}
@@ -215,40 +205,6 @@ struct LinuxOptions : public Options {
 		assert(mram_root_end_addr < mram_data_start_addr && "MRAM root too big, would overlap MRAM root");
 		mram_data_end_addr = mram_data_start_addr + mram_data_size - 1;
 		assert(mram_data_end_addr < mem_start_addr && "MRAM too big, would overlap memory");
-		if (!has_option("cache-ace-dram-window-start") && cache_ace_dram_window_size > 0 &&
-		    cache_ace_dram_window_size <= mem_size) {
-			/*
-			 * 默认 cache_ace 窗口需要避开 kernel 装载地址，并落在设备树
-			 * reserved-memory 可描述的 DRAM 范围内。这样 Linux 侧 PTE/PBMT
-			 * 测试驱动可以安全 mmap 该窗口，不会覆盖内核镜像。
-			 */
-			const addr_t reserved_start = std::max<addr_t>(mem_start_addr, CACHE_ACE_RESERVED_START_ADDR);
-			const addr_t reserved_size = mem_end_addr - reserved_start + 1;
-			if (cache_ace_dram_window_size <= reserved_size) {
-				cache_ace_dram_window_start = reserved_start;
-			} else {
-				cache_ace_dram_window_start = (mem_end_addr + 1) - cache_ace_dram_window_size;
-				cache_ace_dram_window_start &= ~static_cast<addr_t>(0xFFF);
-				if (cache_ace_dram_window_start < mem_start_addr) {
-					cache_ace_dram_window_start = mem_start_addr;
-				}
-			}
-		}
-#if defined(TARGET_RV64) || defined(TARGET_RV64_CHERIV9)
-		if (!has_option("cache-ace-dram-window-size") && cache_ace_dram_window_start <= mem_end_addr) {
-			/* RV64 设备树把 cache-ace reserved-memory 描述为从 0xe0000000 到
-			 * DRAM 末尾。这里同步 VP 侧 DMI 挖洞/PMA region 的大小，确保
-			 * PMA、NC、IO 三个分段都会经过 master-ACE cache-control 路径。 */
-			cache_ace_dram_window_size = mem_end_addr - cache_ace_dram_window_start + 1;
-		}
-#endif
-		if (cache_ace_dram_window_start < mem_start_addr || cache_ace_dram_window_start > mem_end_addr) {
-			cache_ace_dram_window_size = 0;
-		}
-		if (cache_ace_dram_window_size > 0) {
-			const addr_t max_window_size = mem_end_addr - cache_ace_dram_window_start + 1;
-			cache_ace_dram_window_size = std::min(cache_ace_dram_window_size, max_window_size);
-		}
 	}
 };
 
@@ -262,7 +218,6 @@ class Core {
 	CombinedMemoryInterface memif;
 #endif
 	InstrMemoryProxy imemif;
-	std::vector<MemoryDMI> prepared_data_dmi_ranges;
 
 	Core(RV_ISA_Config *isa_config, unsigned int id, MemoryDMI dmi, uint64_t mem_start_addr, uint64_t mem_end_addr)
 	    : iss(isa_config, id),
@@ -279,7 +234,7 @@ class Core {
 	void init(bool use_data_dmi, bool use_instr_dmi, bool use_dbbcache, bool use_lscache, clint_if *clint,
 	          uint64_t entry, uint64_t sp_base, bool cheri_purecap = false) {
 		if (use_data_dmi)
-			memif.dmi_ranges = prepared_data_dmi_ranges;
+			memif.dmi_ranges.emplace_back(imemif.dmi);
 
 #ifdef TARGET_RV64_CHERIV9
 		iss.init(get_instr_memory_if(use_instr_dmi), use_dbbcache, &memif, use_lscache, clint, entry, sp_base,
@@ -297,37 +252,6 @@ class Core {
 			return &memif;
 	}
 };
-
-class DummyBusMaster : public sc_core::sc_module {
-   public:
-	tlm_utils::simple_initiator_socket<DummyBusMaster> socket;
-
-	DummyBusMaster(sc_core::sc_module_name name) : sc_core::sc_module(name), socket("socket") {}
-};
-
-template <typename AddRangeFn>
-void add_dmi_ranges_with_cache_ace_window(uint8_t *mem, uint64_t mem_start_addr, uint64_t mem_size,
-                                          uint64_t cache_ace_window_start, uint64_t cache_ace_window_size,
-                                          AddRangeFn add_range) {
-	/* PTE/PBMT 测试窗口必须从 data DMI 中挖掉，否则 CPU 数据访问会直接命中
-	 * host 内存指针，绕过 TLM/master-ace/coherent L2，导致看不到 PBMT/PMA
-	 * 对事务属性和一致性路径的影响。 */
-	const uint64_t mem_end_addr = mem_start_addr + mem_size;
-	const uint64_t window_start = std::max(cache_ace_window_start, mem_start_addr);
-	const uint64_t window_end = std::min(cache_ace_window_start + cache_ace_window_size, mem_end_addr);
-
-	if (cache_ace_window_size == 0 || window_start >= window_end) {
-		add_range(mem, mem_start_addr, mem_size);
-		return;
-	}
-
-	if (window_start > mem_start_addr) {
-		add_range(mem, mem_start_addr, window_start - mem_start_addr);
-	}
-	if (window_end < mem_end_addr) {
-		add_range(mem + (window_end - mem_start_addr), window_end, mem_end_addr - window_end);
-	}
-}
 
 void handle_kernel_file(const LinuxOptions opt, load_if &mem) {
 	if (opt.kernel_file.size() == 0) {
@@ -352,12 +276,6 @@ int sc_main(int argc, char **argv) {
 
 	LinuxOptions opt;
 	opt.parse(argc, argv);
-
-	std::cout << "Info: enabled extension " << vp::extensions::ace_l2_memory::extension_name()
-	          << " (" << vp::extensions::ace_l2_memory::compiled_components()
-	          << " libsystemctlm-soc components, sync="
-	          << (vp::extensions::ace_l2_memory::remoteport_sync_ready() ? "ready" : "missing") << ")"
-	          << std::endl;
 
 	if (!opt.property_tree_is_loaded) {
 		/*
@@ -398,12 +316,6 @@ int sc_main(int argc, char **argv) {
 		debug_bus = new NetTrace(opt.debug_bus_port);
 	}
 	SimpleBus<NUM_CORES + 1, 20> bus("SimpleBus", debug_bus, opt.break_on_transaction);
-#if defined(TARGET_RV64) && (NUM_CORES > 1)
-	vp::extensions::ace_l2_memory::SharedAceL2MemorySubsystem<NUM_CORES> ace_subsystem("AceSubsystem", opt.mem_size,
-	                                                                                    false);
-	ACEMaster<32 * 1024, 64> *core_l1_master_aces[NUM_CORES];
-	DummyBusMaster *unused_bus_masters[NUM_CORES - 1];
-#endif
 	SyscallHandler sys("SyscallHandler");
 	SIFIVE_PLIC plic("PLIC", true, NUM_CORES, 53);
 	LWRT_CLINT<NUM_CORES> clint("CLINT");
@@ -437,128 +349,23 @@ int sc_main(int argc, char **argv) {
 	DS1307 *rtc_ds1307 = new DS1307();
 	i2c.register_device(0x68, rtc_ds1307);
 
+#ifdef TARGET_RV64_CHERIV9
+	MemoryDMI dmi = MemoryDMI::create_start_size_mapping(mem.data, opt.mem_start_addr, mem.get_size(), &mem.tag_bits);
+#else
+	MemoryDMI dmi = MemoryDMI::create_start_size_mapping(mem.data, opt.mem_start_addr, mem.get_size());
+#endif
+
 	Core *cores[NUM_CORES];
 	std::shared_ptr<BusLock> bus_lock = std::make_shared<BusLock>();
 	for (unsigned i = 0; i < NUM_CORES; i++) {
-		MemoryDMI instr_dmi = MemoryDMI::create_start_size_mapping(mem.data, opt.mem_start_addr, mem.get_size());
-		cores[i] = new Core(&isa_config, i, instr_dmi, opt.mem_start_addr, opt.mem_end_addr);
+		cores[i] = new Core(&isa_config, i, dmi, opt.mem_start_addr, opt.mem_end_addr);
 
 		cores[i]->memif.bus_lock = bus_lock;
 		cores[i]->mmu.mem = &cores[i]->memif;
 
-#if defined(TARGET_RV32) || defined(TARGET_RV64)
-		if (opt.cache_ace_dram_window_size > 0) {
-			/* PMA 由 VP 平台在 M Mode 语义下初始化，不是 OpenSBI 运行时配置。
-			 * 这里把 PTE/PBMT 测试窗口显式声明为普通主存：可读、可写、可执行，
-			 * cacheable 且 coherent，因此该窗口可以参与 ACE/L2 一致性路径。 */
-			pma_attributes cache_ace_attr;
-			/* memory_type：该物理窗口按普通主存处理，而不是 MMIO/设备内存。 */
-			cache_ace_attr.memory_type = PmaMemoryType::MainMemory;
-			/* read：允许 1/2/4/8 字节读访问，不允许 16 字节读访问，允许 misaligned 标量读。 */
-			cache_ace_attr.read = {true, true, true, true, false, true};
-			/* write：允许 1/2/4/8 字节写访问，不允许 16 字节写访问，允许 misaligned 标量写。 */
-			cache_ace_attr.write = {true, true, true, true, false, true};
-			/* execute：允许 16-bit RVC 和 32-bit 普通指令取指，不允许 1/8/16 字节取指。 */
-			cache_ace_attr.execute = {false, true, true, false, false, true};
-			/* ordering：普通内存使用 RISC-V 默认 RVWMO 内存顺序模型。 */
-			cache_ace_attr.ordering = PmaOrdering::RVWMO;
-			/* cacheable：允许该窗口进入 cache 层次，而不是作为 uncached 设备访问。 */
-			cache_ace_attr.cacheable = true;
-			/* coherent：该窗口参与一致性维护，可走 master-ace/coherent L2 路径。 */
-			cache_ace_attr.coherent = true;
-			/* amo_class：允许常见算术 AMO，用于普通可缓存主存的 atomic 操作。 */
-			cache_ace_attr.amo_class = PmaAmoClass::AMOArithmetic;
-			/* reservability：允许 LR/SC，并声明具备 eventual forward-progress 语义。 */
-			cache_ace_attr.reservability = PmaReservability::RsrvEventual;
-
-			const uint64_t pma_mag_page_offset = 0x0fffc000;
-			const uint64_t pma_rsrv_none_page_offset = 0x0fffd000;
-			const uint64_t pma_amo_page_offset = 0x0fffe000;
-			const uint64_t pma_fault_page_offset = 0x0ffff000;
-			const uint64_t pma_fault_page_size = 0x1000;
-			if (opt.cache_ace_dram_window_size > pma_fault_page_offset + pma_fault_page_size) {
-				const uint64_t pma_mag_page_start = opt.cache_ace_dram_window_start + pma_mag_page_offset;
-				const uint64_t pma_rsrv_none_page_start =
-				    opt.cache_ace_dram_window_start + pma_rsrv_none_page_offset;
-				const uint64_t pma_amo_page_start = opt.cache_ace_dram_window_start + pma_amo_page_offset;
-				const uint64_t pma_fault_page_start =
-				    opt.cache_ace_dram_window_start + pma_fault_page_offset;
-				cores[i]->memif.get_pma().set_region(opt.cache_ace_dram_window_start, pma_mag_page_offset,
-				                                      cache_ace_attr, MachineMode);
-
-				/* MAG test page：允许 misaligned 8-byte AMO，只要访问完整落在同一个 16-byte granule 内。 */
-				pma_attributes mag_attr = cache_ace_attr;
-				mag_attr.misaligned_atomicity_granule = 16;
-				cores[i]->memif.get_pma().set_region(pma_mag_page_start, pma_fault_page_size, mag_attr,
-				                                      MachineMode);
-
-				/* LR/SC reservability test page：普通读写/AMO 允许，但 LR/SC 应触发 PMA access-fault。 */
-				pma_attributes rsrv_none_attr = cache_ace_attr;
-				rsrv_none_attr.reservability = PmaReservability::RsrvNone;
-				cores[i]->memif.get_pma().set_region(pma_rsrv_none_page_start, pma_fault_page_size, rsrv_none_attr,
-				                                      MachineMode);
-
-				/* AMO class test page：读/写允许，但只支持 swap/logical AMO，用于 Linux 触发 arithmetic AMO fault。 */
-				pma_attributes amo_logical_attr = cache_ace_attr;
-				amo_logical_attr.amo_class = PmaAmoClass::AMOLogical;
-				cores[i]->memif.get_pma().set_region(pma_amo_page_start, pma_fault_page_size, amo_logical_attr,
-				                                      MachineMode);
-
-				/* fault test page：用于 Linux nofault 自测，读/写都会触发 PMA precise access-fault。 */
-				pma_attributes fault_attr = cache_ace_attr;
-				fault_attr.read = {false, false, false, false, false, false};
-				fault_attr.write = {false, false, false, false, false, false};
-				fault_attr.execute = {false, false, false, false, false, false};
-				fault_attr.page_table_read = false;
-				fault_attr.page_table_write = false;
-				fault_attr.failure_response = PmaFailureResponse::PreciseAccessFault;
-				cores[i]->memif.get_pma().set_region(pma_fault_page_start, pma_fault_page_size, fault_attr,
-				                                      MachineMode);
-
-				cores[i]->memif.get_pma().set_region(
-				    pma_fault_page_start + pma_fault_page_size,
-				    opt.cache_ace_dram_window_size - pma_fault_page_offset - pma_fault_page_size, cache_ace_attr,
-				    MachineMode);
-			} else {
-				cores[i]->memif.get_pma().set_region(opt.cache_ace_dram_window_start, opt.cache_ace_dram_window_size,
-				                                      cache_ace_attr, MachineMode);
-			}
-		}
-#endif
-
-		add_dmi_ranges_with_cache_ace_window(
-		    mem.data, opt.mem_start_addr, mem.get_size(), opt.cache_ace_dram_window_start, opt.cache_ace_dram_window_size,
-		    [&](uint8_t *range_mem, uint64_t range_start, uint64_t range_size) {
-			    cores[i]->prepared_data_dmi_ranges.emplace_back(
-			        MemoryDMI::create_start_size_mapping(range_mem, range_start, range_size));
-		    });
-
 		// enable interactive debug via console
 		channel_console.debug_targets_add(&cores[i]->iss);
 	}
-
-	if (opt.cache_ace_dram_window_size > 0) {
-		const auto window_end = opt.cache_ace_dram_window_start + opt.cache_ace_dram_window_size - 1;
-		std::cout << "Info: DRAM cache_ace window reserved at 0x" << std::hex << opt.cache_ace_dram_window_start << "-0x"
-		          << window_end << std::dec << " (excluded from data DMI)" << std::endl;
-		std::cout << "Info: DRAM cache_ace window PMA is main-memory, cacheable, coherent" << std::endl;
-	}
-
-#if defined(TARGET_RV64) && (NUM_CORES > 1)
-	for (unsigned i = 0; i < NUM_CORES; i++) {
-		core_l1_master_aces[i] = new ACEMaster<32 * 1024, 64>(("CoreMasterACE" + std::to_string(i)).c_str(), WriteBack, i);
-		ace_subsystem.connect_master_ace(i, *core_l1_master_aces[i]);
-	}
-	if (opt.mem_start_addr > 0 && opt.mem_start_addr <= std::numeric_limits<unsigned int>::max()) {
-		const unsigned int uncached_prefix_len = static_cast<unsigned int>(opt.mem_start_addr);
-		for (unsigned i = 0; i < NUM_CORES; i++) {
-			core_l1_master_aces[i]->CreateNonShareableRegion(0, uncached_prefix_len);
-		}
-		ace_subsystem.create_nonshareable_region(0, uncached_prefix_len);
-	}
-	ace_subsystem.bind_downstream(bus.tsocks[0]);
-	std::cout << "Info: MC RV64 memory path uses mmu -> master-ace -> coherent L2 -> bus/memory" << std::endl;
-#endif
 
 	uint64_t entry_point = loader.get_entrypoint();
 	if (opt.entry_point.available)
@@ -567,17 +374,7 @@ int sc_main(int argc, char **argv) {
 	loader.load_executable_image(mem, mem.get_size(), opt.mem_start_addr);
 	sys.init(mem.data, opt.mem_start_addr, loader.get_heap_addr(mem.get_size(), opt.mem_start_addr));
 	for (size_t i = 0; i < NUM_CORES; i++) {
-		bool use_data_dmi = opt.use_data_dmi;
-		bool use_instr_dmi = opt.use_instr_dmi;
-		if (opt.cache_ace_dram_window_size > 0 && use_instr_dmi) {
-			/* 当前 instruction DMI 只支持一段连续映射。启用 cache_ace/PTE 测试窗口时，
-			 * DRAM 被切成“窗口外走 DMI、窗口内走 TLM/ACE”的形态，因此关闭 instr-dmi，
-			 * 保证取指也能经过 memif，从而接受 PMA execute 权限检查。 */
-			std::cerr << "[Options] Info: cache_ace DRAM window disables instr-dmi because instruction DMI only supports one contiguous mapping."
-			          << std::endl;
-			use_instr_dmi = false;
-		}
-		cores[i]->init(use_data_dmi, use_instr_dmi, opt.use_dbbcache, opt.use_lscache, &clint, entry_point,
+		cores[i]->init(opt.use_data_dmi, opt.use_instr_dmi, opt.use_dbbcache, opt.use_lscache, &clint, entry_point,
 		               opt.mem_end_addr, opt.cheri_purecap);
 
 		sys.register_core(&cores[i]->iss);
@@ -613,18 +410,8 @@ int sc_main(int argc, char **argv) {
 
 	// connect TLM sockets
 	for (size_t i = 0; i < NUM_CORES; i++) {
-#if defined(TARGET_RV64) && (NUM_CORES > 1)
-		cores[i]->memif.isock.bind(core_l1_master_aces[i]->cpu_target_socket());
-#else
 		cores[i]->memif.isock.bind(bus.tsocks[i]);
-#endif
 	}
-#if defined(TARGET_RV64) && (NUM_CORES > 1)
-	for (size_t i = 1; i < NUM_CORES; i++) {
-		unused_bus_masters[i - 1] = new DummyBusMaster(("UnusedBusMaster" + std::to_string(i)).c_str());
-		unused_bus_masters[i - 1]->socket.bind(bus.tsocks[i]);
-	}
-#endif
 	dbg_if.isock.bind(bus.tsocks[NUM_CORES]);
 	bus.isocks[0].bind(mem.tsock);
 	bus.isocks[1].bind(clint.tsock);
@@ -669,6 +456,26 @@ int sc_main(int argc, char **argv) {
 		// emulate RISC-V core boot loader
 		cores[i]->iss.regs[RegFile::a0] = cores[i]->iss.get_hart_id();
 		cores[i]->iss.regs[RegFile::a1] = opt.dtb_rom_start_addr;
+		if (opt.early_boot_debug) {
+			// H Extension fdw: arm a focused early boot observer so firmware->kernel handoff failures become visible without enabling full instruction trace.
+			cores[i]->iss.enable_early_boot_debug(entry_point, KERNEL_LOAD_ADDR, opt.dtb_rom_start_addr, 64);
+		}
+		if (opt.guest_mmio_debug) {
+			// H Extension fdw: arm a focused L2 UART observer so lkvm guest silence can be reduced to concrete guest MMIO or trap evidence.
+			cores[i]->iss.enable_guest_mmio_debug(0x10000000, 0x10003fff, 512);
+			cores[i]->iss.enable_guest_exec_debug(512);  // H Extension fdw: keep the guest trace window long enough to follow VP++ beyond setup_vm and catch the first L2 UART MMIO or a later concrete fault.
+		}
+	}
+
+	if (opt.early_boot_debug) {
+		// H Extension fdw: print the platform-level handoff tuple that VP++ seeds before OpenSBI starts, mirroring the key a0/a1/kernel/dtb state needed for Linux boot debugging.
+		std::cout << "[vp::earlyboot] platform"
+		          << " entry=0x" << std::hex << entry_point
+		          << " kernel_raw=0x" << KERNEL_LOAD_ADDR
+		          << " dtb=0x" << opt.dtb_rom_start_addr
+		          << " mem_start=0x" << opt.mem_start_addr
+		          << " mem_end=0x" << opt.mem_end_addr
+		          << std::dec << std::endl;
 	}
 
 	// OpenSBI boots all harts except hart 0 by default.
@@ -685,11 +492,9 @@ int sc_main(int argc, char **argv) {
 
 	// load DTB (Device Tree Binary) file
 	dtb_rom.load_binary_file(opt.dtb_file, 0);
-	std::cout << "Info: DTB loaded" << std::endl;
 
 	// load kernel
 	handle_kernel_file(opt, mem);
-	std::cout << "Info: kernel load complete" << std::endl;
 
 	std::vector<mmu_memory_if *> mmus;
 	std::vector<debug_target_if *> dharts;
@@ -707,14 +512,11 @@ int sc_main(int argc, char **argv) {
 			new DirectCoreRunner(cores[i]->iss);
 		}
 	}
-	std::cout << "Info: core runners initialized" << std::endl;
 
 	/* may not return (exit) */
 	opt.handle_property_export_and_exit();
 
-	std::cout << "Info: entering sc_start" << std::endl;
 	sc_core::sc_start();
-	std::cout << "Info: sc_start returned" << std::endl;
 	for (size_t i = 0; i < NUM_CORES; i++) {
 		cores[i]->iss.show();
 	}

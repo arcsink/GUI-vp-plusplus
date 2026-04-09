@@ -165,6 +165,17 @@ int sc_main(int argc, char **argv) {
 	}
 
 	loader.load_executable_image(mem, mem.get_size(), opt.mem_start_addr);
+	try {
+		const uint64_t tohost_addr = loader.get_to_host_address();
+		if (tohost_addr >= opt.mem_start_addr && tohost_addr + sizeof(uint64_t) <= opt.mem_start_addr + mem.get_size()) {
+			// H Extension fdw: Mirror the upstream HTIF-style completion path so
+			// xtvec-overwrite asm tests can stop on `tohost` before trailing `unimp`.
+			mem.set_tohost_watch_address(tohost_addr - opt.mem_start_addr);
+		}
+	} catch (const std::runtime_error &) {
+		// H Extension fdw: Not every payload exposes a `tohost` symbol, so keep
+		// the generic tiny platform behavior unchanged when HTIF completion is absent.
+	}
 #ifdef TARGET_RV64_CHERIV9
 	core.init(instr_mem_if, opt.use_dbbcache, data_mem_if, opt.use_lscache, &clint, loader.get_entrypoint(),
 	          opt.mem_end_addr, opt.cheri_purecap);

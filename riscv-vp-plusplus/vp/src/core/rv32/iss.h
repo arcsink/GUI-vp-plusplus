@@ -64,6 +64,7 @@ struct timing_if {
 struct PendingInterrupts {
 	PrivilegeLevel target_mode;
 	uxlen_t pending;
+	uxlen_t source_pending;
 };
 
 /*

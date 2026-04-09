@@ -64,9 +64,31 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	FpRegs fp_regs;
 	bool ignore_wfi = false;
 	bool error_on_zero_traphandler = false;
+	bool early_boot_debug = false;
+	uxlen_t early_boot_firmware_entry = 0;
+	uxlen_t early_boot_kernel_addr = 0;
+	uxlen_t early_boot_dtb_addr = 0;
+	uint32_t early_boot_log_budget = 0;
+	PrivilegeLevel early_boot_last_prv = MachineMode;
+	bool early_boot_last_virt = false;
+	bool early_boot_seen_kernel = false;
+	bool guest_mmio_debug = false;
+	uxlen_t guest_mmio_debug_start = 0;
+	uxlen_t guest_mmio_debug_end = 0;
+	uint32_t guest_mmio_debug_budget = 0;
+	bool guest_exec_debug = false;
+	uint32_t guest_exec_debug_budget = 0;
+	uint32_t guest_fetch_xlate_budget = 0;
+	bool guest_exec_have_prev = false;
+	uxlen_t guest_exec_prev_pc = 0;
+	uint32_t guest_exec_prev_instr = 0;
+	bool guest_fetch_have_last_logged_pc = false;
+	uxlen_t guest_fetch_last_logged_pc = 0;
 	ISS_CT_T_CSR_TABLE csrs;
 	VExtension<ISS_CT> v_ext;
 	PrivilegeLevel prv = MachineMode;
+	bool virt = false;
+	bool trap_to_virtual_supervisor = false;
 
 	// last decoded and executed instruction
 	Instruction instr;
@@ -151,6 +173,15 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		trace = ena;
 		force_slow_path();
 	}
+	void enable_early_boot_debug(uxlen_t firmware_entry, uxlen_t kernel_addr, uxlen_t dtb_addr, uint32_t budget);
+	void enable_guest_mmio_debug(uxlen_t start, uxlen_t end, uint32_t budget);
+	void enable_guest_exec_debug(uint32_t budget);
+	bool should_log_guest_mmio_access(uxlen_t paddr) const;
+	bool should_log_guest_fetch_xlate(uxlen_t vaddr) const;
+	void log_guest_mmio_access(const char *op, uxlen_t vaddr, uxlen_t paddr, unsigned size, uint64_t value);
+	void log_guest_fetch_xlate(uxlen_t vaddr, uxlen_t paddr, uint32_t raw_word);
+	void maybe_log_guest_exec_progress();
+	void maybe_log_guest_fetch_decode(uxlen_t current_pc, uxlen_t next_pc, uint32_t raw_instr);
 	bool trace_enabled(void) override {
 		return trace;
 	}
@@ -188,6 +219,8 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	void fp_update_exception_flags();
 	void fp_setup_rm();
 	void fp_require_not_off();
+	void maybe_log_early_boot_progress();
+	void log_early_boot_trap(const SimulationTrap &e, PrivilegeLevel target_mode, uxlen_t last_pc);
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL uxlen_t get_csr_value(uxlen_t addr);
@@ -212,39 +245,39 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
-	inline void execute_amo_w(Instruction &instr, PmaAmoClass amo_class,
-	                          std::function<int32_t(int32_t, int32_t)> operation) {
+	inline void execute_amo_w(Instruction &instr, std::function<int32_t(int32_t, int32_t)> operation) {
 		stats.inc_amo();
 		uxlen_t addr = regs[instr.rs1()];
+		trap_check_addr_alignment<4, false>(addr);
 		int32_t data;
 		try {
-			data = mem->atomic_load_word(addr, amo_class);
+			data = mem->atomic_load_word(addr);
 		} catch (SimulationTrap &e) {
 			if (e.reason == EXC_LOAD_ACCESS_FAULT)
 				e.reason = EXC_STORE_AMO_ACCESS_FAULT;
 			throw e;
 		}
 		int32_t val = operation(data, (int32_t)regs[instr.rs2()]);
-		mem->atomic_store_word(addr, val, amo_class);
+		mem->atomic_store_word(addr, val);
 		// ignore write to zero/x0
 		if (instr.rd() != RegFile::zero) {
 			regs[instr.rd()] = data;
 		}
 	}
 
-	inline void execute_amo_d(Instruction &instr, PmaAmoClass amo_class,
-	                          std::function<int64_t(int64_t, int64_t)> operation) {
+	inline void execute_amo_d(Instruction &instr, std::function<int64_t(int64_t, int64_t)> operation) {
 		uxlen_t addr = regs[instr.rs1()];
+		trap_check_addr_alignment<8, false>(addr);
 		uint64_t data;
 		try {
-			data = mem->atomic_load_double(addr, amo_class);
+			data = mem->atomic_load_double(addr);
 		} catch (SimulationTrap &e) {
 			if (e.reason == EXC_LOAD_ACCESS_FAULT)
 				e.reason = EXC_STORE_AMO_ACCESS_FAULT;
 			throw e;
 		}
 		uint64_t val = operation(data, regs[instr.rs2()]);
-		mem->atomic_store_double(addr, val, amo_class);
+		mem->atomic_store_double(addr, val);
 		// ignore write to zero/x0
 		if (instr.rd() != RegFile::zero) {
 			regs[instr.rd()] = data;
@@ -272,6 +305,22 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 
 	void prepare_interrupt(const PendingInterrupts &x);
 
+	uxlen_t compute_hs_interrupt_enable_mask();  // H Extension fdw: expose only the HS interrupt-enable bits delegated from M
+
+	uxlen_t compute_hs_interrupt_pending_read_mask();  // H Extension fdw: expose only the HS interrupt-pending bits visible through sip
+
+	uxlen_t compute_hs_interrupt_pending_write_mask();  // H Extension fdw: keep HS software-pending bits writable through sip only when delegated from M
+
+	uxlen_t compute_vs_interrupt_enable_mask();  // H Extension fdw: expose only the VS interrupt-enable bits delegated to VS or injected through HVIEN
+
+	uxlen_t compute_vs_visible_interrupt_enables();  // H Extension fdw: merge delegated mie alias bits with explicit VS-only enable state
+
+	uxlen_t compute_vs_interrupt_pending_read_mask();  // H Extension fdw: expose only the VS interrupt-pending bits visible through sip/vsip
+
+	uxlen_t compute_vs_interrupt_pending_write_mask();  // H Extension fdw: keep VS software-pending bits writable through sip/vsip only when delegated to VS
+
+	uxlen_t compute_vs_visible_interrupts();  // H Extension fdw: merge delegated and injected VS-visible interrupt pending bits
+
 	PendingInterrupts compute_pending_interrupts();
 
 	bool has_pending_enabled_interrupts() {
@@ -280,13 +329,14 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL bool has_local_pending_enabled_interrupts() {
-		return csrs.mie.reg.val & csrs.mip.reg.val;
+		return (csrs.mie.reg.val & csrs.mip.reg.val) ||
+		       (virt && (compute_vs_visible_interrupts() & compute_vs_visible_interrupt_enables()));  // H Extension fdw: make WFI/interrupt polling observe the effective VS-visible interrupt-enable view, including delegated alias bits
 	}
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL void return_from_trap_handler(PrivilegeLevel return_mode);
 
-	void switch_to_trap_handler(PrivilegeLevel target_mode);
+	void switch_to_trap_handler(PrivilegeLevel target_mode, const SimulationTrap *trap = nullptr);  // H Extension fdw: pass trap metadata so HS/M can fill htinst/htval/mtinst/mtval2
 
 	/* see NOTE RVxx.1 and NOTE RVxx.2 in iss_ctemplate_handle.h */
 	PROP_METHOD_VIRTUAL void handle_interrupt();

@@ -39,6 +39,7 @@ struct csr_misa {
 		D = 1 << 3,
 		E = 1 << 4,
 		F = 1 << 5,
+		H = 1 << 7,
 		I = 1 << 8,
 		M = 1 << 12,
 		N = 1 << 13,
@@ -71,8 +72,9 @@ class RV_ISA_Config {
 	uint64_t cfg = 0;
 
 	RV_ISA_Config(bool use_E_base_isa = false, bool en_Zfh = false) {
-		// init default: IMACFDV + NUS
-		cfg = csr_misa::I | csr_misa::M | csr_misa::A | csr_misa::F | csr_misa::D | csr_misa::C | csr_misa::N |
+		// H Extension fdw: include H in the default ISA set so misa reads, hypervisor CSRs, and xRET virtualization state are architecturally active.
+		// init default: IMACFDVH + NUS
+		cfg = csr_misa::I | csr_misa::M | csr_misa::A | csr_misa::F | csr_misa::D | csr_misa::C | csr_misa::H | csr_misa::N |
 		      csr_misa::U | csr_misa::S | csr_misa::V;
 
 		if (use_E_base_isa) {
