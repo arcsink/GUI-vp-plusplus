@@ -21,9 +21,9 @@ MEM_SIZE_RV32=$(shell echo $$((1 * 1024*1024*1024)))	# 1 GiB
 MEM_SIZE_RV64=$(shell echo $$((2 * 1024*1024*1024)))	# 2 GiB
 
 
-.PHONY: help all get dtb build_rv32 build_rv64 build vp-rebuild buildroot-reconfigure	\
-	buildroot_rv32-rebuild buildroot_rv64-rebuild buildroot-rebuild						\
-	run_rv32 run_rv64 clean distclean
+.PHONY: help all get dtb build_rv32 build_rv64 build build_vp_extension vp-rebuild	\
+	buildroot-reconfigure buildroot_rv32-rebuild buildroot_rv64-rebuild				\
+	buildroot-rebuild run_rv32 run_rv64 clean distclean
 
 help:
 	@echo
@@ -45,6 +45,10 @@ build_rv32: .stamp/vp_build .stamp/buildroot_rv32_build dt/linux-vp_rv32_sc.dtb 
 build_rv64: .stamp/vp_build .stamp/buildroot_rv64_build dt/linux-vp_rv64_sc.dtb dt/linux-vp_rv64_mc.dtb
 
 build: build_rv32 build_rv64
+
+build_vp_extension: .stamp/vp_get
+	@echo " + BUILD VP LIBSYSTEMCTLM-SOC EXTENSION"
+	RELEASE_BUILD=ON $(MAKE) vp-libsystemctlm-soc-ext -C $(VP_NAME) -j$(NPROCS)
 
 vp-rebuild:
 	rm -rf .stamp/vp_build
@@ -99,7 +103,7 @@ run_rv32_mc: build_rv32
 		buildroot_rv32/output/images/fw_jump.elf
 
 run_rv64_mc: build_rv64
-	$(VP_NAME)/vp/build/bin/linux-vp							\
+	$(VP_NAME)/vp/build/bin/linux64-mc-vp						\
 		$(VP_ARGS)												\
 		--dtb-file=dt/linux-vp_rv64_mc.dtb						\
 		--kernel-file buildroot_rv64/output/images/Image		\
@@ -136,9 +140,12 @@ distclean:
 
 .stamp/vp_get: .stamp/init
 	@echo " + GET RISC-V VP"
-	rm -rf $(VP_NAME)
-	git clone $(VP_GIT) $(VP_NAME)
-	( cd $(VP_NAME) && git checkout $(VP_VERSION) )
+	@if [ -d "$(VP_NAME)/.git" ]; then \
+		echo "   - existing source found, skip clone"; \
+	else \
+		git clone $(VP_GIT) $(VP_NAME); \
+		( cd $(VP_NAME) && git checkout $(VP_VERSION) ); \
+	fi
 	@touch $@
 
 .stamp/vp_build: .stamp/vp_get
@@ -152,10 +159,17 @@ distclean:
 
 .stamp/buildroot_get: .stamp/init
 	@echo " + GET BUILDROOT"
-	rm -rf buildroot_rv32 buildroot_rv64
-	git clone $(BUILDROOT_GIT) buildroot_rv32
-	( cd buildroot_rv32 && git checkout $(BUILDROOT_VERSION) )
-	cp -a buildroot_rv32 buildroot_rv64
+	@if [ -d "buildroot_rv32/.git" ]; then \
+		echo "   - existing buildroot_rv32 source found, skip clone"; \
+	else \
+		git clone $(BUILDROOT_GIT) buildroot_rv32; \
+		( cd buildroot_rv32 && git checkout $(BUILDROOT_VERSION) ); \
+	fi
+	@if [ -d "buildroot_rv64/.git" ]; then \
+		echo "   - existing buildroot_rv64 source found, skip copy"; \
+	else \
+		cp -a buildroot_rv32 buildroot_rv64; \
+	fi
 	@touch $@
 
 .stamp/buildroot_config: .stamp/buildroot_get

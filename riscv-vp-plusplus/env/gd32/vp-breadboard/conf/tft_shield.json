@@ -1,0 +1,46 @@
+{
+  "window" : {
+    "background" : ":/img/tft_shield.png",
+    "windowsize" : [498, 418]
+  },
+  "devices" :
+  [
+    {
+      "class" : "tft",
+      "id"    : "display",
+      "spi"   :
+      { 
+        "cs_pin" : 4,
+        "port": "A",
+        "noresponse": false
+      },
+      "exmc"  :
+      { 
+        "cs_pin" : 7,
+        "port": "D"
+      },
+      "pins"  :
+      [
+        {
+          "device_pin" : 1,
+          "global_pin" : 11,
+          "port": "D",
+          "name": "dc_pin",
+          "synchronous" : true
+        },
+        {
+          "device_pin" : 2,
+          "global_pin" : 4,
+          "port": "E",
+          "name" : "output",
+          "synchronous" : false 
+        } 
+      ],
+      "graphics" :
+      {
+        "offs" : [116, 93],
+        "scale" : 1
+      }
+    }
+  ]
+}

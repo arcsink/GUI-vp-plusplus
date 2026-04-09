@@ -1,0 +1,173 @@
+#include <boost/io/ios_state.hpp>
+#include <boost/program_options.hpp>
+#include <cstdlib>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+
+#include "core/common/clint.h"
+#include "core/common/debug_memory.h"
+#include "core/common/gdb-mc/gdb_runner.h"
+#include "core/common/gdb-mc/gdb_server.h"
+#include "core/rv32/elf_loader.h"
+#include "core/rv32/iss.h"
+#include "core/rv32/mem.h"
+#include "core/rv32/syscall.h"
+#include "microrv32_gpio.h"
+#include "microrv32_led.h"
+#include "microrv32_uart.h"
+#include "platform/common/memory.h"
+#include "platform/common/options.h"
+#include "util/options.h"
+#include "util/propertytree.h"
+
+using namespace rv32;
+namespace po = boost::program_options;
+
+class BasicOptions : public Options {
+   public:
+	typedef uint32_t addr_t;
+
+	addr_t clint_start_addr = 0x2000000;
+	addr_t clint_end_addr = 0x200ffff;
+	addr_t sys_start_addr = 0x02010000;
+	addr_t sys_end_addr = 0x020103ff;
+	addr_t mem_start_addr = 0x80000000;
+	addr_t mem_end_addr = 0x80ffffff;
+	addr_t led_start_addr = 0x81000000;
+	addr_t led_end_addr = 0x810000ff;
+	addr_t uart_start_addr = 0x82000000;
+	addr_t uart_end_addr = 0x820000ff;
+	addr_t gpio_a_start_addr = 0x83000000;
+	addr_t gpio_a_end_addr = 0x830000ff;
+
+	addr_t mem_size = mem_end_addr - mem_start_addr;
+
+	bool use_E_base_isa = false;
+
+	OptionValue<uint64_t> entry_point;
+
+	BasicOptions(void) {
+		// clang-format off
+		add_options()
+			("use-E-base-isa", po::bool_switch(&use_E_base_isa), "use the E instead of the I integer base ISA")
+			("entry-point", po::value<std::string>(&entry_point.option),"set entry point address (ISS program counter)");
+		// clang-format on
+	}
+
+	void parse(int argc, char **argv) override {
+		Options::parse(argc, argv);
+
+		entry_point.finalize(parse_uint64_option);
+	}
+};
+
+int sc_main(int argc, char **argv) {
+	// PropertyTree::global()->set_debug(true);
+
+	BasicOptions opt;
+	opt.parse(argc, argv);
+
+	std::srand(std::time(nullptr));  // use current time as seed for random generator
+
+	if (!opt.property_tree_is_loaded) {
+		/*
+		 * property tree was not loaded by Options -> use default model properties
+		 * and values
+		 */
+
+		/* set global clock explicitly to 100 MHz */
+		VPPP_PROPERTY_SET("", "clock_cycle_period", sc_core::sc_time, sc_core::sc_time(10, sc_core::SC_NS));
+	}
+
+	tlm::tlm_global_quantum::instance().set(sc_core::sc_time(opt.tlm_global_quantum, sc_core::SC_NS));
+
+	RV_ISA_Config isa_config(opt.use_E_base_isa, opt.en_ext_Zfh);
+	ISS core(&isa_config, 0);
+
+	SimpleMemory mem("SimpleMemory", opt.mem_size);
+	ELFLoader loader(opt.input_program.c_str());
+	NetTrace *debug_bus = nullptr;
+	if (opt.use_debug_bus) {
+		debug_bus = new NetTrace(opt.debug_bus_port);
+	}
+	SimpleBus<2, 6> bus("SimpleBus", debug_bus, opt.break_on_transaction);
+	CombinedMemoryInterface iss_mem_if("MemoryInterface", core);
+	SyscallHandler sys("SyscallHandler");
+	CLINT<1> clint("CLINT");
+	DebugMemoryInterface dbg_if("DebugMemoryInterface");
+	MicroRV32UART uart("MicroRV32UART");
+	MicroRV32LED led("MicroRV32LED");
+	MicroRV32GPIO gpio_a("MicroRV32GPIO");
+
+	MemoryDMI dmi = MemoryDMI::create_start_size_mapping(mem.data, opt.mem_start_addr, mem.get_size());
+	InstrMemoryProxy instr_mem(dmi, core);
+
+	std::shared_ptr<BusLock> bus_lock = std::make_shared<BusLock>();
+	iss_mem_if.bus_lock = bus_lock;
+
+	instr_memory_if *instr_mem_if = &iss_mem_if;
+	data_memory_if *data_mem_if = &iss_mem_if;
+	if (opt.use_instr_dmi)
+		instr_mem_if = &instr_mem;
+	if (opt.use_data_dmi) {
+		iss_mem_if.dmi_ranges.emplace_back(dmi);
+	}
+
+	uint64_t entry_point = loader.get_entrypoint();
+	if (opt.entry_point.available)
+		entry_point = opt.entry_point.value;
+
+	loader.load_executable_image(mem, mem.get_size(), opt.mem_start_addr);
+	core.init(instr_mem_if, opt.use_dbbcache, data_mem_if, opt.use_lscache, &clint, entry_point, opt.mem_end_addr);
+	sys.init(mem.data, opt.mem_start_addr, loader.get_heap_addr(mem.get_size(), opt.mem_start_addr));
+	sys.register_core(&core);
+
+	if (opt.intercept_syscalls)
+		core.sys = &sys;
+	core.error_on_zero_traphandler = opt.error_on_zero_traphandler;
+
+	// address mapping
+	bus.ports[0] = new PortMapping(opt.mem_start_addr, opt.mem_end_addr, mem);
+	bus.ports[1] = new PortMapping(opt.clint_start_addr, opt.clint_end_addr, clint);
+	bus.ports[2] = new PortMapping(opt.uart_start_addr, opt.uart_end_addr, uart);
+	bus.ports[3] = new PortMapping(opt.sys_start_addr, opt.sys_end_addr, sys);
+	bus.ports[4] = new PortMapping(opt.led_start_addr, opt.led_end_addr, led);
+	bus.ports[5] = new PortMapping(opt.gpio_a_start_addr, opt.gpio_a_end_addr, gpio_a);
+	bus.mapping_complete();
+
+	// connect TLM sockets
+	iss_mem_if.isock.bind(bus.tsocks[0]);
+	dbg_if.isock.bind(bus.tsocks[1]);
+
+	bus.isocks[0].bind(mem.tsock);
+	bus.isocks[1].bind(clint.tsock);
+	bus.isocks[2].bind(uart.tsock);
+	bus.isocks[3].bind(sys.tsock);
+	bus.isocks[4].bind(led.tsock);
+	bus.isocks[5].bind(gpio_a.tsock);
+
+	// connect interrupt signals/communication
+	clint.target_harts[0] = &core;
+
+	std::vector<debug_target_if *> threads;
+	threads.push_back(&core);
+
+	core.enable_trace(opt.trace_mode);  // switch for printing instructions
+
+	if (opt.use_debug_runner) {
+		auto server = new GDBServer("GDBServer", threads, &dbg_if, opt.debug_port, opt.debug_cont_sim_on_wait);
+		new GDBServerRunner("GDBRunner", server, &core);
+	} else {
+		new DirectCoreRunner(core);
+	}
+
+	/* may not return (exit) */
+	opt.handle_property_export_and_exit();
+
+	sc_core::sc_start();
+
+	core.show();
+
+	return 0;
+}

@@ -1,0 +1,12 @@
+.stamp/
+.vscode/
+buildroot_dl/
+buildroot_rv32/output/
+buildroot_rv64/output/
+riscv-vp-plusplus/vp/build/
+riscv-vp-plusplus/vp/build-asan/
+riscv-vp-plusplus/vp/build-asan-link/
+dt/*.dtb
+runtime_mram/*.img
+ds_1307_date_time_diff
+ds_1307_state
