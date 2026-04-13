@@ -80,14 +80,14 @@ bool is_coherent_addr =
 
 这些条件来自 decode、LSU、AMO/LRSC 单元或后续 CMO/prefetch 单元。
 
-| 变量 | 含义 |
-| --- | --- |
-| `instr_class` | `Load / Store / LR / SC / AMO / Fence / SfenceVma / Prefetch / CMO` |
-| `aq` | AMO/LR/SC acquire 位 |
-| `rl` | AMO/SC release 位 |
-| `amo_kind` | `swap/add/xor/and/or/min/max/...` |
-| `is_full_line_store` | store 是否覆盖整条 cache line |
-| `need_data_return` | 写前是否必须读取旧 line 数据 |
+| 变量                 | 含义                                                              |
+| -------------------- | ----------------------------------------------------------------- |
+| `instr_class`        | `Load / Store / LR / SC / AMO / Fence / SfenceVma / Prefetch / CMO` |
+| `aq`                 | AMO/LR/SC acquire 位                                              |
+| `rl`                 | AMO/SC release 位                                                 |
+| `amo_kind`           | `swap/add/xor/and/or/min/max/...`                                 |
+| `is_full_line_store` | store 是否覆盖整条 cache line                                     |
+| `need_data_return`   | 写前是否必须读取旧 line 数据                                      |
 
 `need_data_return` 通常由 `!is_full_line_store` 推导；partial store 和 AMO RMW
 都必须拿旧数据。
