@@ -270,6 +270,9 @@ private:
 		tlm_ext_pbmt *pbmt_ext = nullptr;
 		trans.get_extension(genattr);
 		trans.get_extension(pbmt_ext);
+		const tlm_ext_pbmt default_pbmt;
+		const tlm_ext_pbmt& addr_attr = pbmt_ext ? *pbmt_ext : default_pbmt;
+		const bool ace_cacheable = addr_attr.ace_cacheable();
 
 		bool created_extension = false;
 		if (!genattr) {
@@ -286,7 +289,7 @@ private:
 		genattr->set_write_allocate(true);
 		genattr->set_domain(Domain::Inner);
 
-		if (pbmt_ext && !pbmt_ext->ace_cacheable()) {
+		if (!ace_cacheable) {
 			genattr->set_bufferable(false);
 			genattr->set_modifiable(false);
 			genattr->set_read_allocate(false);
@@ -300,11 +303,12 @@ private:
 			          << (trans.is_read() ? "READ" : (trans.is_write() ? "WRITE" : "OTHER"))
 			          << " addr=0x" << std::hex << trans.get_address() << std::dec
 			          << " len=" << trans.get_data_length()
-			          << " pbmt=" << pbmt_to_string(pbmt_ext ? pbmt_ext->pbmt : static_cast<uint8_t>(tlm_ext_pbmt::PMA))
-			          << " pma_mem=" << pma_memory_type_to_string(pbmt_ext ? pbmt_ext->pma_memory_type : static_cast<uint8_t>(tlm_ext_pbmt::PMA_MEMORY_MAIN))
-			          << " pma_cacheable=" << (pbmt_ext ? pbmt_ext->pma_cacheable : true)
-			          << " pma_coherent=" << (pbmt_ext ? pbmt_ext->pma_coherent : true)
-			          << " ace_cacheable=" << (pbmt_ext ? pbmt_ext->ace_cacheable() : true)
+			          << " pbmt=" << pbmt_to_string(addr_attr.pbmt)
+			          << " pma_mem=" << pma_memory_type_to_string(addr_attr.pma_memory_type)
+			          << " pma_cacheable=" << addr_attr.pma_cacheable
+			          << " pma_coherent=" << addr_attr.pma_coherent
+			          << " cacheable=" << addr_attr.derived_cacheable()
+			          << " ace_cacheable=" << ace_cacheable
 			          << " domain=" << static_cast<unsigned>(genattr->get_domain())
 			          << " bufferable=" << genattr->get_bufferable()
 			          << " modifiable=" << genattr->get_modifiable()

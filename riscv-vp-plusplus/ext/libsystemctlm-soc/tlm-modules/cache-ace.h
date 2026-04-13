@@ -38,6 +38,7 @@
 #include "tlm_utils/simple_target_socket.h"
 #include "tlm-extensions/genattr.h"
 #include "tlm-bridges/amba.h"
+#include "util/tlm_ext_pbmt.h"
 
 using namespace AMBA::ACE;
 
@@ -1651,8 +1652,14 @@ private:
 	bool force_no_snoop(tlm::tlm_generic_payload& gp)
 	{
 		genattr_extension *genattr;
+		tlm_ext_pbmt *pbmt_ext;
 
 		gp.get_extension(genattr);
+		gp.get_extension(pbmt_ext);
+		if (pbmt_ext && !pbmt_ext->ace_cacheable()) {
+			return true;
+		}
+
 		if (!genattr) {
 			return false;
 		}

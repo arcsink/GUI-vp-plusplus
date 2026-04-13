@@ -52,8 +52,18 @@ class tlm_ext_pbmt : public tlm::tlm_extension<tlm_ext_pbmt> {
 		return pma_memory_type == PMA_MEMORY_MAIN && pma_cacheable && pma_coherent;
 	}
 
+	bool derived_cacheable() const {
+		return !pte_forces_uncached() && pma_cacheable;
+	}
+
+	bool is_coherent_addr() const {
+		return derived_cacheable() &&
+		       pma_memory_type == PMA_MEMORY_MAIN &&
+		       pma_coherent;
+	}
+
 	bool ace_cacheable() const {
-		return !pte_forces_uncached() && pma_allows_ace_cache();
+		return is_coherent_addr();
 	}
 
 	tlm::tlm_extension_base *clone() const override {
