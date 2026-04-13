@@ -96,12 +96,12 @@ bool is_coherent_addr =
 
 这些条件来自 ROB、LSU barrier 状态机或当前 VP 的阻塞式 b_transport 顺序。
 
-| 变量 | 含义 |
-| --- | --- |
-| `fence_block` | 当前是否被 FENCE 阻塞 |
-| `aq_block` | acquire 约束是否阻止后续访问越过 |
-| `rl_block` | release 约束是否要求 older 访问先可见 |
-| `sfence_vma_active` | 是否正在进行地址翻译同步 |
+| 变量                | 含义                                      |
+| ------------------- | ----------------------------------------- |
+| `fence_block`       | 当前是否被 FENCE 阻塞                     |
+| `aq_block`          | acquire 约束是否阻止后续访问越过          |
+| `rl_block`          | release 约束是否要求 older 访问先可见     |
+| `sfence_vma_active` | 是否正在进行地址翻译同步                  |
 
 原则：
 
