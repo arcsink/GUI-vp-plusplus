@@ -8,7 +8,6 @@
 #include <stdint.h>
 
 #include "core/common_cheriv9/cheri_capability.h"
-#include "core/common/pma.h"
 
 struct instr_memory_if {
 	virtual uint32_t load_instr(uint64_t pc) = 0;
@@ -43,6 +42,35 @@ struct data_memory_if_T {
 	virtual T_uxlen_t load_uhalf(uint64_t addr) = 0;
 	virtual T_uxlen_t load_ubyte(uint64_t addr) = 0;
 
+	// H Extension fdw: route HLV/HLVX guest loads through the shared MMU path with explicit guest translation flags.
+	virtual int64_t guest_load_double(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_sxlen_t guest_load_word(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_sxlen_t guest_load_half(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_sxlen_t guest_load_byte(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_uxlen_t guest_load_uword(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_uxlen_t guest_load_uhalf(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_uxlen_t guest_load_ubyte(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_uxlen_t guest_load_exec_uword(uint64_t addr) {
+		assert(0);
+	}
+	virtual T_uxlen_t guest_load_exec_uhalf(uint64_t addr) {
+		assert(0);
+	}
+
 	/* for cheriv9 (optional for others) */
 	virtual Capability load_cap(uint64_t addr) {
 		assert(0);
@@ -53,22 +81,34 @@ struct data_memory_if_T {
 	virtual void store_half(uint64_t addr, uint16_t value) = 0;
 	virtual void store_byte(uint64_t addr, uint8_t value) = 0;
 
+	// H Extension fdw: route HSV guest stores through the shared MMU path with explicit guest translation flags.
+	virtual void guest_store_double(uint64_t addr, uint64_t value) {
+		assert(0);
+	}
+	virtual void guest_store_word(uint64_t addr, uint32_t value) {
+		assert(0);
+	}
+	virtual void guest_store_half(uint64_t addr, uint16_t value) {
+		assert(0);
+	}
+	virtual void guest_store_byte(uint64_t addr, uint8_t value) {
+		assert(0);
+	}
+
 	/* for cheriv9 (optional for others) */
 	virtual void store_cap(uint64_t addr, Capability value) {
 		assert(0);
 	}
 
-	virtual T_sxlen_t atomic_load_word(uint64_t addr, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) = 0;
-	virtual void atomic_store_word(uint64_t addr, uint32_t value,
-	                               PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) = 0;
+	virtual T_sxlen_t atomic_load_word(uint64_t addr) = 0;
+	virtual void atomic_store_word(uint64_t addr, uint32_t value) = 0;
 	virtual T_sxlen_t atomic_load_reserved_word(uint64_t addr) = 0;
 	virtual bool atomic_store_conditional_word(uint64_t addr, uint32_t value) = 0;
 	virtual void atomic_unlock() = 0;
 
 	/* unused on RV32 */
-	virtual int64_t atomic_load_double(uint64_t addr, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) = 0;
-	virtual void atomic_store_double(uint64_t addr, uint64_t value,
-	                                 PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic) = 0;
+	virtual int64_t atomic_load_double(uint64_t addr) = 0;
+	virtual void atomic_store_double(uint64_t addr, uint64_t value) = 0;
 	virtual int64_t atomic_load_reserved_double(uint64_t addr) = 0;
 	virtual bool atomic_store_conditional_double(uint64_t addr, uint64_t value) = 0;
 

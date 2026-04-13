@@ -49,6 +49,10 @@ struct csr_misa_64 : csr_misa {
 		return reg.fields.extensions & E;
 	}
 
+	bool has_hypervisor_extension() {
+		return reg.fields.extensions & H;
+	}
+
 	bool has_user_mode_extension() {
 		return reg.fields.extensions & U;
 	}
@@ -110,7 +114,9 @@ struct csr_mstatus {
 			unsigned sxl : 2;
 			unsigned sbe : 1;
 			unsigned mbe : 1;
-			unsigned wpri5 : 25;
+			unsigned gva : 1;    // H Extension fdw: guest virtual address marker on trap into M-mode
+			unsigned mpv : 1;    // H Extension fdw: previous virtualization state saved for MRET
+			unsigned wpri5 : 23;
 			unsigned sd : 1;
 		} fields;
 	} reg;
@@ -214,6 +220,29 @@ struct csr_mcounteren {
 	} reg;
 };
 
+struct csr_menvcfg {
+	union reg {
+		uint64_t val = 0;
+		struct fields {
+			unsigned fiom : 1;
+			unsigned wpri1 : 1;
+			unsigned lpe : 1;      // H Extension fdw: menvcfg.LPE influences virtualization landing-pad behavior
+			unsigned sse : 1;
+			unsigned cbie : 2;
+			unsigned cbcfe : 1;
+			unsigned cbze : 1;
+			uint64_t wpri2 : 24;
+			unsigned pmm : 2;      // H Extension fdw: menvcfg.PMM provides pointer masking state shared with H paths
+			uint64_t wpri3 : 25;
+			unsigned dte : 1;      // H Extension fdw: menvcfg.DTE controls double-trap behavior visible to H flows
+			unsigned cde : 1;
+			unsigned adue : 1;
+			unsigned pbmte : 1;
+			unsigned stce : 1;
+		} fields;
+	} reg;
+};
+
 struct csr_mcountinhibit {
 	union reg {
 		uint64_t val = 0;
@@ -253,6 +282,76 @@ struct csr_satp {
 			uint64_t ppn : 44;   // WARL
 			unsigned asid : 16;  // WARL
 			unsigned mode : 4;   // WARL
+		} fields;
+	} reg;
+};
+
+struct csr_hstatus {
+	csr_hstatus() {
+		reg.fields.vsxl = 2;  // H Extension fdw: hardwire VSXL to RV64 for now
+	}
+
+	union reg {
+		uint64_t val = 0;
+		struct fields {
+			unsigned wpri1 : 5;
+			unsigned vsbe : 1;    // H Extension fdw: VS-mode endianness
+			unsigned gva : 1;     // H Extension fdw: guest virtual address indicator for HS trap
+			unsigned spv : 1;     // H Extension fdw: previous virtualization state for SRET
+			unsigned spvp : 1;    // H Extension fdw: previous virtual privilege for HLV/HSV and SRET
+			unsigned hu : 1;      // H Extension fdw: permit HLV/HSV from U-mode
+			unsigned wpri2 : 2;
+			unsigned vgein : 6;   // H Extension fdw: guest external interrupt number
+			unsigned wpri3 : 2;
+			unsigned vtvm : 1;    // H Extension fdw: virtual TVM trap control
+			unsigned vtw : 1;     // H Extension fdw: virtual TW trap control
+			unsigned vtsr : 1;    // H Extension fdw: virtual TSR trap control
+			unsigned wpri4 : 1;
+			unsigned hukte : 1;   // H Extension fdw: permit ukte in virtualized U-mode path
+			unsigned wpri5 : 7;
+			unsigned vsxl : 2;    // H Extension fdw: VS XLEN
+			uint64_t wpri6 : 14;
+			unsigned hupmm : 2;   // H Extension fdw: U-mode pointer masking mode for virtualization
+			uint64_t wpri7 : 14;
+		} fields;
+	} reg;
+};
+
+struct csr_hgatp {
+	union reg {
+		uint64_t val = 0;
+		struct fields {
+			uint64_t ppn : 44;   // H Extension fdw: G-stage root page number
+			unsigned vmid : 14;  // H Extension fdw: guest address-space identifier
+			unsigned wpri : 2;
+			unsigned mode : 4;   // H Extension fdw: G-stage translation mode (Off/Sv39x4/Sv48x4/Sv57x4)
+		} fields;
+	} reg;
+};
+
+struct csr_vsstatus {
+	union reg {
+		uint64_t val = 0;
+		struct fields {
+			unsigned uie : 1;
+			unsigned sie : 1;
+			unsigned wpri1 : 2;
+			unsigned upie : 1;
+			unsigned spie : 1;
+			unsigned ube : 1;
+			unsigned wpri2 : 1;
+			unsigned spp : 1;
+			unsigned vs : 2;
+			unsigned wpri3 : 2;
+			unsigned fs : 2;
+			unsigned xs : 2;
+			unsigned wpri4 : 1;
+			unsigned sum : 1;    // H Extension fdw: VS supervisor may access U pages when set
+			unsigned mxr : 1;    // H Extension fdw: VS loads may treat execute-only pages as readable
+			unsigned wpri5 : 12;
+			unsigned uxl : 2;    // H Extension fdw: VS-visible UXL field for guest U-mode
+			uint64_t wpri6 : 29;
+			unsigned sd : 1;
 		} fields;
 	} reg;
 };
@@ -357,6 +456,49 @@ constexpr uint64_t UIP_MASK = 0b1;
 
 constexpr uint64_t MEDELEG_MASK = 0b1011101111111111;
 constexpr uint64_t MIDELEG_MASK = MIE_MASK;
+constexpr uint64_t HEDELEG_MASK = 0b1011000111111111;
+constexpr uint64_t HIDELEG_MASK = 0b001000100010;
+constexpr uint64_t HVIP_MASK = 0b10001000100;   // H Extension fdw: keep HS virtual interrupt-pending bits on the architected VS legacy interrupt positions (VSSIP/VSTIP/VSEIP)
+constexpr uint64_t HVIEN_MASK = 0b10001000100;  // H Extension fdw: keep HS virtual interrupt-enable bits on the architected VS legacy interrupt positions (VSSIP/VSTIP/VSEIP)
+constexpr uint64_t MSTATUS_GVA = 0x4000000000ULL;  // H Extension fdw: mstatus.GVA
+constexpr uint64_t MSTATUS_MPV = 0x8000000000ULL;
+constexpr uint64_t HSTATUS_VSBE = 0x00000020ULL;      // H Extension fdw: hstatus.VSBE
+constexpr uint64_t HSTATUS_GVA = 0x00000040ULL;       // H Extension fdw: hstatus.GVA
+constexpr uint64_t HSTATUS_SPV = 0x00000080ULL;
+constexpr uint64_t HSTATUS_SPVP = 0x00000100ULL;
+constexpr uint64_t HSTATUS_HU = 0x00000200ULL;        // H Extension fdw: hstatus.HU
+constexpr uint64_t HSTATUS_VGEIN = 0x0003F000ULL;     // H Extension fdw: hstatus.VGEIN
+constexpr uint64_t HSTATUS_VTVM = 0x00100000ULL;      // H Extension fdw: hstatus.VTVM
+constexpr uint64_t HSTATUS_VTW = 0x00200000ULL;       // H Extension fdw: hstatus.VTW
+constexpr uint64_t HSTATUS_VTSR = 0x00400000ULL;      // H Extension fdw: hstatus.VTSR
+constexpr uint64_t HSTATUS_HUKTE = 0x01000000ULL;     // H Extension fdw: hstatus.HUKTE
+constexpr uint64_t HSTATUS_VSXL = 0x300000000ULL;     // H Extension fdw: hstatus.VSXL
+constexpr uint64_t HSTATUS_HUPMM = 0x3000000000000ULL;  // H Extension fdw: hstatus.HUPMM
+constexpr uint64_t HSTATUS_READ_MASK = HSTATUS_VSBE | HSTATUS_GVA | HSTATUS_SPV | HSTATUS_SPVP | HSTATUS_HU |
+                                       HSTATUS_VGEIN | HSTATUS_VTVM | HSTATUS_VTW | HSTATUS_VTSR | HSTATUS_HUKTE |
+                                       HSTATUS_VSXL | HSTATUS_HUPMM;  // H Extension fdw: expose architecturally visible hstatus bits
+constexpr uint64_t HSTATUS_WRITE_MASK = HSTATUS_GVA | HSTATUS_SPV | HSTATUS_SPVP | HSTATUS_HU | HSTATUS_VTVM |
+                                        HSTATUS_VTW | HSTATUS_VTSR | HSTATUS_HUKTE |
+                                        HSTATUS_HUPMM;  // H Extension fdw: keep VSXL hardwired while allowing software-managed control bits
+constexpr uint64_t HENVCFG_FIOM = 0x0000000000000001ULL;   // H Extension fdw: henvcfg.FIOM
+constexpr uint64_t HENVCFG_LPE = 0x0000000000000004ULL;    // H Extension fdw: henvcfg.LPE
+constexpr uint64_t HENVCFG_SSE = 0x0000000000000008ULL;    // H Extension fdw: henvcfg.SSE
+constexpr uint64_t HENVCFG_CBIE = 0x0000000000000030ULL;   // H Extension fdw: henvcfg.CBIE
+constexpr uint64_t HENVCFG_CBCFE = 0x0000000000000040ULL;  // H Extension fdw: henvcfg.CBCFE
+constexpr uint64_t HENVCFG_CBZE = 0x0000000000000080ULL;   // H Extension fdw: henvcfg.CBZE
+constexpr uint64_t HENVCFG_PMM = 0x0000000300000000ULL;    // H Extension fdw: henvcfg.PMM
+constexpr uint64_t HENVCFG_STCE = 0x8000000000000000ULL;   // H Extension fdw: henvcfg.STCE shares the same architected bit position as menvcfg.STCE
+constexpr uint64_t HENVCFG_BASE_MASK = HENVCFG_FIOM | HENVCFG_LPE | HENVCFG_SSE | HENVCFG_CBIE |
+                                       HENVCFG_CBCFE | HENVCFG_CBZE |
+                                       HENVCFG_PMM;  // H Extension fdw: locally modeled henvcfg bits that are not gated by menvcfg
+constexpr uint64_t MENVCFG_DTE = 0x0800000000000000ULL;    // H Extension fdw: menvcfg.DTE
+constexpr uint64_t MENVCFG_CDE = 0x1000000000000000ULL;    // H Extension fdw: menvcfg.CDE
+constexpr uint64_t MENVCFG_ADUE = 0x2000000000000000ULL;   // H Extension fdw: menvcfg.ADUE
+constexpr uint64_t MENVCFG_PBMTE = 0x4000000000000000ULL;  // H Extension fdw: menvcfg.PBMTE
+constexpr uint64_t MENVCFG_STCE = 0x8000000000000000ULL;   // H Extension fdw: menvcfg.STCE
+constexpr uint64_t HENVCFG_GATED_MASK = MENVCFG_DTE | MENVCFG_CDE | MENVCFG_ADUE | MENVCFG_PBMTE |
+                                        MENVCFG_STCE |
+                                        HENVCFG_SSE;  // H Extension fdw: henvcfg bits whose visibility follows menvcfg policy
 
 constexpr uint64_t MTVEC_MASK = ~2;
 
@@ -370,6 +512,8 @@ constexpr uint64_t MSTATUS_WRITE_MASK = 0b10000000000000000000000000000000000000
 constexpr uint64_t MSTATUS_READ_MASK = 0b1000000000000000000000000011111100000000011111111111111111111011;
 constexpr uint64_t SSTATUS_WRITE_MASK = 0b1000000000000000000000000000000000000000000011011110011100110011;
 constexpr uint64_t SSTATUS_READ_MASK = 0b1000000000000000000000000000001100000000000011011110011101110011;
+constexpr uint64_t VSSTATUS_WRITE_MASK = SSTATUS_WRITE_MASK;  // H Extension fdw: keep VSSTATUS write visibility explicit even while it matches SSTATUS today
+constexpr uint64_t VSSTATUS_READ_MASK = SSTATUS_READ_MASK;    // H Extension fdw: keep VSSTATUS read visibility explicit even while it matches SSTATUS today
 constexpr uint64_t USTATUS_WRITE_MASK = 0b0000000000000000000000000000000000000000000000000000000000010001;
 constexpr uint64_t USTATUS_READ_MASK = 0b0000000000000000000000000000000000000000000000000000000001010001;
 
@@ -377,6 +521,14 @@ constexpr uint64_t PMPADDR_MASK = 0b00000000001111111111111111111111111111111111
 
 constexpr uint64_t SATP_MASK = 0b1111000000000000000011111111111111111111111111111111111111111111;
 constexpr uint64_t SATP_MODE = 0b1111000000000000000000000000000000000000000000000000000000000000;
+constexpr uint64_t HGATP_PPN_MASK = 0x00000FFFFFFFFFFFULL;   // H Extension fdw: HGATP.PPN for RV64
+constexpr uint64_t HGATP_VMID_MASK = 0x03FFF00000000000ULL;  // H Extension fdw: HGATP.VMID for RV64
+constexpr uint64_t HGATP_MODE_MASK = 0xF000000000000000ULL;  // H Extension fdw: HGATP.MODE for RV64
+constexpr uint64_t HGATP_MASK = HGATP_PPN_MASK | HGATP_VMID_MASK | HGATP_MODE_MASK;
+constexpr uint64_t HGATP_MODE_OFF = 0x0ULL;                  // H Extension fdw: disable G-stage translation
+constexpr uint64_t HGATP_MODE_SV39X4 = 0x8ULL;               // H Extension fdw: RV64 G-stage Sv39x4
+constexpr uint64_t HGATP_MODE_SV48X4 = 0x9ULL;               // H Extension fdw: RV64 G-stage Sv48x4
+constexpr uint64_t HGATP_MODE_SV57X4 = 0xAULL;               // H Extension fdw: RV64 G-stage Sv57x4
 
 constexpr uint64_t FCSR_MASK = 0b11111111;
 constexpr uint64_t VTYPE_MASK = 0b1000000000000000000000000000000000000000000000000000000011111111;
@@ -406,6 +558,7 @@ constexpr unsigned MIDELEG_ADDR = 0x303;
 constexpr unsigned MIE_ADDR = 0x304;
 constexpr unsigned MTVEC_ADDR = 0x305;
 constexpr unsigned MCOUNTEREN_ADDR = 0x306;
+constexpr unsigned MENVCFG_ADDR = 0x30A;
 constexpr unsigned MCOUNTINHIBIT_ADDR = 0x320;
 
 constexpr unsigned MSCRATCH_ADDR = 0x340;
@@ -413,6 +566,8 @@ constexpr unsigned MEPC_ADDR = 0x341;
 constexpr unsigned MCAUSE_ADDR = 0x342;
 constexpr unsigned MTVAL_ADDR = 0x343;
 constexpr unsigned MIP_ADDR = 0x344;
+constexpr unsigned MTINST_ADDR = 0x34A;
+constexpr unsigned MTVAL2_ADDR = 0x34B;
 
 constexpr unsigned PMPCFG0_ADDR = 0x3A0;
 constexpr unsigned PMPCFG1_ADDR = 0x3A1;
@@ -443,12 +598,61 @@ constexpr unsigned SIDELEG_ADDR = 0x103;
 constexpr unsigned SIE_ADDR = 0x104;
 constexpr unsigned STVEC_ADDR = 0x105;
 constexpr unsigned SCOUNTEREN_ADDR = 0x106;
+constexpr unsigned SENVCFG_ADDR = 0x10A;      // H Extension fdw: align extended S-mode envcfg CSR address with QEMU
+constexpr unsigned SCOUNTINHIBIT_ADDR = 0x120;  // H Extension fdw: align extended S-mode count inhibit CSR address with QEMU
 constexpr unsigned SSCRATCH_ADDR = 0x140;
 constexpr unsigned SEPC_ADDR = 0x141;
 constexpr unsigned SCAUSE_ADDR = 0x142;
 constexpr unsigned STVAL_ADDR = 0x143;
 constexpr unsigned SIP_ADDR = 0x144;
+constexpr unsigned STIMECMP_ADDR = 0x14D;     // H Extension fdw: align S-mode timer compare CSR address with QEMU
+constexpr unsigned SISELECT_ADDR = 0x150;     // H Extension fdw: align S-mode indirect selector CSR address with QEMU
+constexpr unsigned SIREG_ADDR = 0x151;        // H Extension fdw: align S-mode indirect register window with QEMU
+constexpr unsigned SIREG2_ADDR = 0x152;       // H Extension fdw: align S-mode indirect register alias with QEMU
+constexpr unsigned SIREG3_ADDR = 0x153;       // H Extension fdw: align S-mode indirect register alias with QEMU
+constexpr unsigned SIPH_ADDR = 0x154;         // H Extension fdw: align RV32 AIA S-mode high-half pending CSR address with QEMU
+constexpr unsigned SIREG4_ADDR = 0x155;       // H Extension fdw: align S-mode indirect register alias with QEMU
+constexpr unsigned SIREG5_ADDR = 0x156;       // H Extension fdw: align S-mode indirect register alias with QEMU
+constexpr unsigned SIREG6_ADDR = 0x157;       // H Extension fdw: align S-mode indirect register alias with QEMU
+constexpr unsigned STOPEI_ADDR = 0x15C;       // H Extension fdw: align S-mode top external interrupt CSR address with QEMU
 constexpr unsigned SATP_ADDR = 0x180;
+constexpr unsigned STOPI_ADDR = 0xDB0;        // H Extension fdw: align S-mode top pending interrupt CSR address with QEMU
+constexpr unsigned VSSTATUS_ADDR = 0x200;
+constexpr unsigned VSTVEC_ADDR = 0x205;
+constexpr unsigned VSSCRATCH_ADDR = 0x240;
+constexpr unsigned VSEPC_ADDR = 0x241;
+constexpr unsigned VSCAUSE_ADDR = 0x242;
+constexpr unsigned VSTVAL_ADDR = 0x243;
+constexpr unsigned VSATP_ADDR = 0x280;
+constexpr unsigned VSISELECT_ADDR = 0x250;    // H Extension fdw: align VS indirect selector CSR address with QEMU
+constexpr unsigned VSIREG_ADDR = 0x251;       // H Extension fdw: align VS indirect register window with QEMU
+constexpr unsigned VSIREG2_ADDR = 0x252;      // H Extension fdw: align VS indirect register alias with QEMU
+constexpr unsigned VSIREG3_ADDR = 0x253;      // H Extension fdw: align VS indirect register alias with QEMU
+constexpr unsigned VSIREG4_ADDR = 0x255;      // H Extension fdw: align VS indirect register alias with QEMU
+constexpr unsigned VSIREG5_ADDR = 0x256;      // H Extension fdw: align VS indirect register alias with QEMU
+constexpr unsigned VSIREG6_ADDR = 0x257;      // H Extension fdw: align VS indirect register alias with QEMU
+constexpr unsigned VSTOPEI_ADDR = 0x25C;      // H Extension fdw: align VS top external interrupt CSR address with QEMU
+constexpr unsigned VSTOPI_ADDR = 0xEB0;       // H Extension fdw: align VS top pending interrupt CSR address with QEMU
+
+// hypervisor CSRs
+constexpr unsigned HSTATUS_ADDR = 0x600;
+constexpr unsigned HEDELEG_ADDR = 0x602;
+constexpr unsigned HIDELEG_ADDR = 0x603;
+constexpr unsigned HIE_ADDR = 0x604;          // H Extension fdw: align HS interrupt-enable CSR address with QEMU
+constexpr unsigned HTIMEDELTA_ADDR = 0x605;   // H Extension fdw: align HS time-delta CSR address with QEMU
+constexpr unsigned HCOUNTEREN_ADDR = 0x606;   // H Extension fdw: align HS counter-enable CSR address with QEMU
+constexpr unsigned HGEIE_ADDR = 0x607;        // H Extension fdw: align HS guest-external interrupt enable CSR address with QEMU
+constexpr unsigned HVIEN_ADDR = 0x608;        // H Extension fdw: align HS virtual interrupt-enable CSR address with QEMU
+constexpr unsigned HENVCFG_ADDR = 0x60A;      // H Extension fdw: align HS envcfg CSR address with QEMU
+constexpr unsigned HGATP_ADDR = 0x680;
+constexpr unsigned HTVAL_ADDR = 0x643;        // H Extension fdw: align HS trap value CSR address with QEMU
+constexpr unsigned HIP_ADDR = 0x644;          // H Extension fdw: align HS interrupt-pending CSR address with QEMU
+constexpr unsigned HVIP_ADDR = 0x645;         // H Extension fdw: align HS virtual interrupt-pending CSR address with QEMU
+constexpr unsigned HTINST_ADDR = 0x64A;       // H Extension fdw: align HS trap instruction CSR address with QEMU
+constexpr unsigned HGEIP_ADDR = 0xE12;        // H Extension fdw: align HS guest-external interrupt pending CSR address with QEMU
+constexpr unsigned VSIE_ADDR = 0x204;         // H Extension fdw: align VS interrupt-enable CSR address with QEMU
+constexpr unsigned VSIP_ADDR = 0x244;         // H Extension fdw: align VS interrupt-pending CSR address with QEMU
+constexpr unsigned VSTIMECMP_ADDR = 0x24D;    // H Extension fdw: align VS timer compare CSR address with QEMU
 
 // 32 bit user CSRs
 constexpr unsigned USTATUS_ADDR = 0x000;
@@ -643,6 +847,7 @@ struct csr_table {
 	csr_mie mie;
 	csr_mtvec mtvec;
 	csr_mcounteren mcounteren;
+	csr_menvcfg menvcfg;    // H Extension fdw: M-mode execution environment configuration
 	csr_mcountinhibit mcountinhibit;
 
 	csr_64 mscratch;
@@ -650,6 +855,8 @@ struct csr_table {
 	csr_mcause mcause;
 	csr_64 mtval;
 	csr_mip mip;
+	csr_64 mtinst;          // H Extension fdw: M-mode trap instruction value
+	csr_64 mtval2;          // H Extension fdw: M-mode second trap value
 
 	// pmp configuration
 	std::array<csr_pmpaddr, 16> pmpaddr;
@@ -661,11 +868,57 @@ struct csr_table {
 	csr_64 sideleg;
 	csr_mtvec stvec;
 	csr_mcounteren scounteren;
+	csr_64 senvcfg;          // H Extension fdw: S-mode execution environment configuration
+	csr_64 scountinhibit;    // H Extension fdw: S-mode counter inhibit state
 	csr_64 sscratch;
 	csr_mepc sepc;
 	csr_mcause scause;
 	csr_64 stval;
+	csr_64 stimecmp;         // H Extension fdw: S-mode timer compare value
+	csr_64 siselect;         // H Extension fdw: S-mode indirect CSR selector window
+	csr_64 sireg;
+	csr_64 sireg2;
+	csr_64 sireg3;
+	csr_64 sireg4;
+	csr_64 sireg5;
+	csr_64 sireg6;
+	csr_64 stopei;
+	csr_64 stopi;
 	csr_satp satp;
+	csr_vsstatus vsstatus;
+	csr_mtvec vstvec;
+	csr_64 vsscratch;
+	csr_64 vsepc;            // H Extension fdw: keep VSEPC as a plain XLEN-wide trap return address register
+	csr_mcause vscause;
+	csr_64 vstval;
+	csr_satp vsatp;
+	csr_64 vsie;             // H Extension fdw: VS interrupt-enable state
+	csr_64 vsip;             // H Extension fdw: VS interrupt-pending state
+	csr_64 vstimecmp;        // H Extension fdw: VS timer compare state
+	csr_64 vsiselect;        // H Extension fdw: VS indirect CSR selector window
+	csr_64 vsireg;
+	csr_64 vsireg2;
+	csr_64 vsireg3;
+	csr_64 vsireg4;
+	csr_64 vsireg5;
+	csr_64 vsireg6;
+	csr_64 vstopei;
+	csr_64 vstopi;
+	csr_hstatus hstatus;
+	csr_64 hedeleg;
+	csr_64 hideleg;
+	csr_64 hie;              // H Extension fdw: HS interrupt-enable state
+	csr_64 hip;              // H Extension fdw: HS interrupt-pending state
+	csr_64 hvip;             // H Extension fdw: HS virtual interrupt-pending state
+	csr_64 hvien;            // H Extension fdw: HS virtual interrupt-enable state
+	csr_mcounteren hcounteren;  // H Extension fdw: HS counter-enable state
+	csr_64 hgeie;            // H Extension fdw: HS guest external interrupt enable state
+	csr_64 htval;            // H Extension fdw: HS trap value state
+	csr_64 htinst;           // H Extension fdw: HS trap instruction state
+	csr_64 hgeip;            // H Extension fdw: HS guest external interrupt pending state
+	csr_hgatp hgatp;
+	csr_64 htimedelta;       // H Extension fdw: HS virtual time delta
+	csr_menvcfg henvcfg;     // H Extension fdw: HS execution environment configuration
 
 	// user csrs (see above comment)
 	csr_mtvec utvec;
@@ -708,6 +961,7 @@ struct csr_table {
 		register_mapping[MIE_ADDR] = &mie.reg.val;
 		register_mapping[MTVEC_ADDR] = &mtvec.reg.val;
 		register_mapping[MCOUNTEREN_ADDR] = &mcounteren.reg.val;
+		register_mapping[MENVCFG_ADDR] = &menvcfg.reg.val;
 		register_mapping[MCOUNTINHIBIT_ADDR] = &mcountinhibit.reg.val;
 
 		register_mapping[MSCRATCH_ADDR] = &mscratch.reg.val;
@@ -715,6 +969,8 @@ struct csr_table {
 		register_mapping[MCAUSE_ADDR] = &mcause.reg.val;
 		register_mapping[MTVAL_ADDR] = &mtval.reg.val;
 		register_mapping[MIP_ADDR] = &mip.reg.val;
+		register_mapping[MTINST_ADDR] = &mtinst.reg.val;
+		register_mapping[MTVAL2_ADDR] = &mtval2.reg.val;
 
 		for (unsigned i = 0; i < 16; ++i) register_mapping[PMPADDR0_ADDR + i] = &pmpaddr[i].reg.val;
 
@@ -724,11 +980,57 @@ struct csr_table {
 		register_mapping[SIDELEG_ADDR] = &sideleg.reg.val;
 		register_mapping[STVEC_ADDR] = &stvec.reg.val;
 		register_mapping[SCOUNTEREN_ADDR] = &scounteren.reg.val;
+		register_mapping[SENVCFG_ADDR] = &senvcfg.reg.val;
+		register_mapping[SCOUNTINHIBIT_ADDR] = &scountinhibit.reg.val;
 		register_mapping[SSCRATCH_ADDR] = &sscratch.reg.val;
 		register_mapping[SEPC_ADDR] = &sepc.reg.val;
 		register_mapping[SCAUSE_ADDR] = &scause.reg.val;
 		register_mapping[STVAL_ADDR] = &stval.reg.val;
+		register_mapping[STIMECMP_ADDR] = &stimecmp.reg.val;  // H Extension fdw: expose stimecmp through the CSR table so Sstc probing sees a real register
+		register_mapping[SISELECT_ADDR] = &siselect.reg.val;
+		register_mapping[SIREG_ADDR] = &sireg.reg.val;
+		register_mapping[SIREG2_ADDR] = &sireg2.reg.val;
+		register_mapping[SIREG3_ADDR] = &sireg3.reg.val;
+		register_mapping[SIREG4_ADDR] = &sireg4.reg.val;
+		register_mapping[SIREG5_ADDR] = &sireg5.reg.val;
+		register_mapping[SIREG6_ADDR] = &sireg6.reg.val;
+		register_mapping[STOPEI_ADDR] = &stopei.reg.val;
+		register_mapping[STOPI_ADDR] = &stopi.reg.val;
 		register_mapping[SATP_ADDR] = &satp.reg.val;
+		register_mapping[VSSTATUS_ADDR] = &vsstatus.reg.val;
+		register_mapping[VSTVEC_ADDR] = &vstvec.reg.val;
+		register_mapping[VSSCRATCH_ADDR] = &vsscratch.reg.val;
+		register_mapping[VSEPC_ADDR] = &vsepc.reg.val;
+		register_mapping[VSCAUSE_ADDR] = &vscause.reg.val;
+		register_mapping[VSTVAL_ADDR] = &vstval.reg.val;
+		register_mapping[VSATP_ADDR] = &vsatp.reg.val;
+		register_mapping[VSIE_ADDR] = &vsie.reg.val;
+		register_mapping[VSIP_ADDR] = &vsip.reg.val;
+		register_mapping[VSTIMECMP_ADDR] = &vstimecmp.reg.val;  // H Extension fdw: expose vstimecmp through the CSR table so VS timer compare has a real backing register
+		register_mapping[VSISELECT_ADDR] = &vsiselect.reg.val;
+		register_mapping[VSIREG_ADDR] = &vsireg.reg.val;
+		register_mapping[VSIREG2_ADDR] = &vsireg2.reg.val;
+		register_mapping[VSIREG3_ADDR] = &vsireg3.reg.val;
+		register_mapping[VSIREG4_ADDR] = &vsireg4.reg.val;
+		register_mapping[VSIREG5_ADDR] = &vsireg5.reg.val;
+		register_mapping[VSIREG6_ADDR] = &vsireg6.reg.val;
+		register_mapping[VSTOPEI_ADDR] = &vstopei.reg.val;
+		register_mapping[VSTOPI_ADDR] = &vstopi.reg.val;
+		register_mapping[HSTATUS_ADDR] = &hstatus.reg.val;
+		register_mapping[HEDELEG_ADDR] = &hedeleg.reg.val;
+		register_mapping[HIDELEG_ADDR] = &hideleg.reg.val;
+		register_mapping[HIE_ADDR] = &hie.reg.val;
+		register_mapping[HIP_ADDR] = &hip.reg.val;
+		register_mapping[HVIP_ADDR] = &hvip.reg.val;
+		register_mapping[HVIEN_ADDR] = &hvien.reg.val;
+		register_mapping[HCOUNTEREN_ADDR] = &hcounteren.reg.val;
+		register_mapping[HGEIE_ADDR] = &hgeie.reg.val;
+		register_mapping[HTVAL_ADDR] = &htval.reg.val;
+		register_mapping[HTINST_ADDR] = &htinst.reg.val;
+		register_mapping[HGEIP_ADDR] = &hgeip.reg.val;
+		register_mapping[HGATP_ADDR] = &hgatp.reg.val;
+		register_mapping[HTIMEDELTA_ADDR] = &htimedelta.reg.val;
+		register_mapping[HENVCFG_ADDR] = &henvcfg.reg.val;
 
 		register_mapping[UTVEC_ADDR] = &utvec.reg.val;
 		register_mapping[USCRATCH_ADDR] = &uscratch.reg.val;

@@ -167,6 +167,36 @@ constexpr uint32_t WFI_MASK = 0b11111111111111111111111111111111;
 constexpr uint32_t WFI_ENCODING = 0b00010000010100000000000001110011;
 constexpr uint32_t SFENCE_VMA_MASK = 0b11111110000000000111111111111111;
 constexpr uint32_t SFENCE_VMA_ENCODING = 0b00010010000000000000000001110011;
+constexpr uint32_t HFENCE_VVMA_MASK = 0b11111110000000000111111111111111;
+constexpr uint32_t HFENCE_VVMA_ENCODING = 0b00100010000000000000000001110011;
+constexpr uint32_t HFENCE_GVMA_MASK = 0b11111110000000000111111111111111;
+constexpr uint32_t HFENCE_GVMA_ENCODING = 0b01100010000000000000000001110011;
+constexpr uint32_t HLV_B_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_B_ENCODING = 0b01100000000000000100000001110011;
+constexpr uint32_t HLV_BU_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_BU_ENCODING = 0b01100000000100000100000001110011;
+constexpr uint32_t HLV_H_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_H_ENCODING = 0b01100100000000000100000001110011;
+constexpr uint32_t HLV_HU_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_HU_ENCODING = 0b01100100000100000100000001110011;
+constexpr uint32_t HLVX_HU_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLVX_HU_ENCODING = 0b01100100001100000100000001110011;
+constexpr uint32_t HLV_W_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_W_ENCODING = 0b01101000000000000100000001110011;
+constexpr uint32_t HLV_WU_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_WU_ENCODING = 0b01101000000100000100000001110011;
+constexpr uint32_t HLVX_WU_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLVX_WU_ENCODING = 0b01101000001100000100000001110011;
+constexpr uint32_t HLV_D_MASK = 0b11111111111100000111000001111111;
+constexpr uint32_t HLV_D_ENCODING = 0b01101100000000000100000001110011;
+constexpr uint32_t HSV_B_MASK = 0b11111110000000000111011111111111;
+constexpr uint32_t HSV_B_ENCODING = 0b01100010000000000100000001110011;
+constexpr uint32_t HSV_H_MASK = 0b11111110000000000111011111111111;
+constexpr uint32_t HSV_H_ENCODING = 0b01100110000000000100000001110011;
+constexpr uint32_t HSV_W_MASK = 0b11111110000000000111011111111111;
+constexpr uint32_t HSV_W_ENCODING = 0b01101010000000000100000001110011;
+constexpr uint32_t HSV_D_MASK = 0b11111110000000000111011111111111;
+constexpr uint32_t HSV_D_ENCODING = 0b01101110000000000100000001110011;
 
 //-- RV64IMA Extension
 constexpr uint32_t LWU_MASK = 0b00000000000000000111000001111111;
@@ -2649,6 +2679,21 @@ std::array<const char *, Operation::OpId::NUMBER_OF_OPERATIONS> Operation::opIdS
     "MRET",
     "WFI",
     "SFENCE_VMA",
+    "HFENCE_GVMA",
+    "HFENCE_VVMA",
+    "HLV.B",
+    "HLV.BU",
+    "HLV.H",
+    "HLV.HU",
+    "HLVX.HU",
+    "HLV.W",
+    "HLV.WU",
+    "HLVX.WU",
+    "HLV.D",
+    "HSV.B",
+    "HSV.H",
+    "HSV.W",
+    "HSV.D",
 };
 
 Operation::Type Operation::getType(Operation::OpId opId) {
@@ -2674,6 +2719,8 @@ Operation::Type Operation::getType(Operation::OpId opId) {
 		case AND:
 		case AND_NOP:
 		case SFENCE_VMA:
+		case HFENCE_GVMA:
+		case HFENCE_VVMA:
 		case MUL:
 		case MUL_NOP:
 		case MULH:
@@ -2851,6 +2898,15 @@ Operation::Type Operation::getType(Operation::OpId opId) {
 		case ECALL:
 		case EBREAK:
 		case WFI:
+		case HLV_B:
+		case HLV_BU:
+		case HLV_H:
+		case HLV_HU:
+		case HLVX_HU:
+		case HLV_W:
+		case HLV_WU:
+		case HLVX_WU:
+		case HLV_D:
 		case FENCE_I:
 		case FENCE:
 		case URET:
@@ -2871,6 +2927,10 @@ Operation::Type Operation::getType(Operation::OpId opId) {
 		case SH:
 		case SW:
 		case SD:
+		case HSV_B:
+		case HSV_H:
+		case HSV_W:
+		case HSV_D:
 		case FSW:
 		case FSD:
 		case FSH:
@@ -4419,10 +4479,69 @@ Operation::OpId Instruction::decode_normal(Architecture arch, const RV_ISA_Confi
 						case F12_WFI:
 							MATCH_AND_RETURN_INSTR(WFI);
 						default:
-							MATCH_AND_RETURN_INSTR(SFENCE_VMA);
+							switch (instr.funct7()) {
+								case F7_SFENCE_VMA:
+									MATCH_AND_RETURN_INSTR(SFENCE_VMA);
+								case F7_HFENCE_VVMA:
+									MATCH_AND_RETURN_INSTR(HFENCE_VVMA);
+								case F7_HFENCE_GVMA:
+									MATCH_AND_RETURN_INSTR(HFENCE_GVMA);
+							}
 					}
 					break;
 				}
+				case F3_HLVHSV:
+					switch (instr.funct7()) {
+						case F7_HLV_B:
+							switch (instr.rs2()) {
+								case RS2_HLV_B:
+									MATCH_AND_RETURN_INSTR(HLV_B);
+								case RS2_HLV_BU:
+									MATCH_AND_RETURN_INSTR(HLV_BU);
+							}
+							break;
+						case F7_HLV_H:
+							switch (instr.rs2()) {
+								case RS2_HLV_H:
+									MATCH_AND_RETURN_INSTR(HLV_H);
+								case RS2_HLV_HU:
+									MATCH_AND_RETURN_INSTR(HLV_HU);
+								case RS2_HLVX_HU:
+									MATCH_AND_RETURN_INSTR(HLVX_HU);
+							}
+							break;
+						case F7_HLV_W:
+							switch (instr.rs2()) {
+								case RS2_HLV_W:
+									MATCH_AND_RETURN_INSTR(HLV_W);
+								case RS2_HLV_WU:
+									MATCH_AND_RETURN_INSTR(HLV_WU);
+								case RS2_HLVX_WU:
+									MATCH_AND_RETURN_INSTR(HLVX_WU);
+							}
+							break;
+						case F7_HLV_D:
+							if (instr.rs2() == RS2_HLV_D)
+								MATCH_AND_RETURN_INSTR(HLV_D);
+							break;
+						case F7_HSV_B:
+							if (instr.rd() == 0)
+								MATCH_AND_RETURN_INSTR(HSV_B);
+							break;
+						case F7_HSV_H:
+							if (instr.rd() == 0)
+								MATCH_AND_RETURN_INSTR(HSV_H);
+							break;
+						case F7_HSV_W:
+							if (instr.rd() == 0)
+								MATCH_AND_RETURN_INSTR(HSV_W);
+							break;
+						case F7_HSV_D:
+							if (instr.rd() == 0)
+								MATCH_AND_RETURN_INSTR(HSV_D);
+							break;
+					}
+					break;
 				case F3_CSRRW:
 					MATCH_AND_RETURN_INSTR(CSRRW);
 				case F3_CSRRS:
