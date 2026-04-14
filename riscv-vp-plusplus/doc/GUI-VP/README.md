@@ -13,6 +13,13 @@ The main features of *GUI-VP* are:
  * Efficient boot (Memory-mapped file for rootfs)
  * Persistent storage (Memory-mapped file for data)
 
+Local design notes:
+ * [Master ACE L1 cache transaction rules](MASTER_ACE_L1_TRANSACTION_RULES.md)
+ * [Master ACE AMO and CHI atomic design](MASTER_ACE_AMO_CHI_DESIGN.md)
+ * [PMA/PBMT to ACE test notes](PMA_PBMT_ACE_TEST.md)
+ * [PMA changelog](PMA_CHANGELOG.md)
+ * [VP source changelog](VP_SRC_CHANGELOG.md)
+
 **We strongly recommend using *GUI-VP* with [GUI-VP Kit](https://github.com/ics-jku/GUI-VP_Kit).
 *GUI-VP Kit* provides an easy-to-use build system and experimentation platform for *GUI-VP* and Linux.**
 

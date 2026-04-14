@@ -36,6 +36,7 @@ using namespace std;
 #include "traffic-generators/tg-tlm.h"
 #include "tlm-modules/cache-ace.h"
 #include "tlm-modules/bp-ace.h"
+#include "util/tlm_ext_atomic.h"
 #include "util/tlm_ext_pbmt.h"
 
 template<int SZ_CACHE, int SZ_CACHELINE>
@@ -80,6 +81,32 @@ public:
 			return "io";
 		default:
 			return "unknown";
+		}
+	}
+
+	static const char *amo_op_to_string(TlmAmoOp op)
+	{
+		switch (op) {
+		case TlmAmoOp::Swap:
+			return "swap";
+		case TlmAmoOp::Add:
+			return "add";
+		case TlmAmoOp::Xor:
+			return "xor";
+		case TlmAmoOp::And:
+			return "and";
+		case TlmAmoOp::Or:
+			return "or";
+		case TlmAmoOp::MinSigned:
+			return "mins";
+		case TlmAmoOp::MaxSigned:
+			return "maxs";
+		case TlmAmoOp::MinUnsigned:
+			return "minu";
+		case TlmAmoOp::MaxUnsigned:
+			return "maxu";
+		default:
+			return "none";
 		}
 	}
 
@@ -171,10 +198,19 @@ public:
 		{
 			if (m_debug_tx_count < m_debug_print_budget &&
 			    m_trace_filter.matches(trans.get_address())) {
+				genattr_extension *genattr = nullptr;
+				trans.get_extension(genattr);
 				std::cout << "[MasterACE " << name() << "] "
 				          << (trans.is_read() ? "READ" : (trans.is_write() ? "WRITE" : "OTHER"))
 				          << " addr=0x" << std::hex << trans.get_address() << std::dec
-				          << " len=" << trans.get_data_length() << std::endl;
+				          << " len=" << trans.get_data_length();
+				if (genattr) {
+					std::cout << " snoop=0x" << std::hex
+					          << static_cast<unsigned>(genattr->get_snoop()) << std::dec
+					          << " domain=" << static_cast<unsigned>(genattr->get_domain())
+					          << " barrier=" << genattr->get_barrier();
+				}
+				std::cout << std::endl;
 				m_debug_tx_count++;
 			}
 			init_socket->b_transport(trans, delay);
@@ -268,8 +304,10 @@ private:
 	{
 		genattr_extension *genattr = nullptr;
 		tlm_ext_pbmt *pbmt_ext = nullptr;
+		tlm_ext_atomic *atomic_ext = nullptr;
 		trans.get_extension(genattr);
 		trans.get_extension(pbmt_ext);
+		trans.get_extension(atomic_ext);
 		const tlm_ext_pbmt default_pbmt;
 		const tlm_ext_pbmt& addr_attr = pbmt_ext ? *pbmt_ext : default_pbmt;
 		const bool ace_cacheable = addr_attr.ace_cacheable();
@@ -313,8 +351,15 @@ private:
 			          << " bufferable=" << genattr->get_bufferable()
 			          << " modifiable=" << genattr->get_modifiable()
 			          << " rd_alloc=" << genattr->get_read_allocate()
-			          << " wr_alloc=" << genattr->get_write_allocate()
-			          << std::endl;
+			          << " wr_alloc=" << genattr->get_write_allocate();
+			if (atomic_ext && atomic_ext->is_amo) {
+				std::cout << " amo=1"
+				          << " amo_op=" << amo_op_to_string(atomic_ext->amo_op)
+				          << " amo_phase=" << (atomic_ext->phase == TlmAtomicPhase::Load ? "load" : "store")
+				          << " aq=" << atomic_ext->aq
+				          << " rl=" << atomic_ext->rl;
+			}
+			std::cout << std::endl;
 			m_debug_cpu_tx_count++;
 		}
 

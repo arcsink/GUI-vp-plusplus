@@ -38,6 +38,7 @@
 #include "tlm_utils/simple_target_socket.h"
 #include "tlm-extensions/genattr.h"
 #include "tlm-bridges/amba.h"
+#include "util/tlm_ext_atomic.h"
 #include "util/tlm_ext_pbmt.h"
 
 using namespace AMBA::ACE;
@@ -1205,6 +1206,16 @@ private:
 			return false;
 		}
 
+		bool is_amo_load(tlm::tlm_generic_payload& trans)
+		{
+			tlm_ext_atomic *atomic_ext;
+
+			trans.get_extension(atomic_ext);
+			return atomic_ext &&
+			       atomic_ext->is_amo &&
+			       atomic_ext->phase == TlmAtomicPhase::Load;
+		}
+
 		bool has_exokay(tlm::tlm_generic_payload& trans)
 		{
 			genattr_extension *genattr;
@@ -1370,6 +1381,7 @@ private:
 			unsigned int len = gp.get_data_length();
 			unsigned int pos = 0;
 			bool exclusive = this->is_exclusive(gp);
+			bool amo_load = this->is_amo_load(gp);
 			bool exclusive_failed = false;
 			bool is_secure = this->get_secure(gp);
 
@@ -1382,19 +1394,26 @@ private:
 				}
 
 				if (hit) {
+					if (amo_load && !this->is_unique(addr)) {
+						// AMO is a read-modify-write operation.  Upgrade a shared hit before
+						// returning the old value so the following store half owns the line.
+						this->clean_unique(gp, addr);
+					}
 					unsigned int n = this->read_line(gp, pos);
 					pos+=n;
 					addr+=n;
 				} else {
-					bool do_read_shared = 
-						exclusive || this->get_toggle();
+					bool do_read_shared =
+						!amo_load &&
+						(exclusive || this->get_toggle());
 
 					//
-					// toggle between read_shared /
-					// read_not_shared_dirty if not
-					// exclusive
+					// AMO miss must fetch the old value and unique permission, so use
+					// ReadUnique rather than the normal shared read policy.
 					//
-					if (do_read_shared) {
+					if (amo_load) {
+						this->read_unique(gp, addr);
+					} else if (do_read_shared) {
 						this->read_shared(gp, addr);
 					} else {
 						this->read_not_shared_dirty(gp, addr);

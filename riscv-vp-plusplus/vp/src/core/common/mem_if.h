@@ -9,6 +9,7 @@
 
 #include "core/common_cheriv9/cheri_capability.h"
 #include "core/common/pma.h"
+#include "util/tlm_ext_atomic.h"
 
 struct instr_memory_if {
 	virtual uint32_t load_instr(uint64_t pc) = 0;
@@ -115,6 +116,13 @@ struct data_memory_if_T {
 
 	virtual void set_next_amo_class(PmaAmoClass amo_class) {
 		(void)amo_class;
+	}
+
+	virtual void set_next_amo(PmaAmoClass amo_class, TlmAmoOp amo_op, bool aq, bool rl) {
+		(void)amo_op;
+		(void)aq;
+		(void)rl;
+		set_next_amo_class(amo_class);
 	}
 
 	/* returns true if the bus is locked */

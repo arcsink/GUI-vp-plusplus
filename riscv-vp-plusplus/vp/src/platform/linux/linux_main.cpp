@@ -76,6 +76,14 @@
 #include "util/propertytree.h"
 #include "util/vncserver.h"
 
+#if defined(TARGET_RV64)
+using namespace sc_core;
+using namespace sc_dt;
+#include "tlm-bridges/amba-ace.h"
+#include "tlm-modules/master-ace.h"
+#include "util/tlm_ext_atomic.h"
+#endif
+
 /* if not defined externally fall back to four worker cores */
 #if !defined(NUM_CORES)
 #define NUM_CORES (4 + 1)
@@ -109,6 +117,129 @@ using namespace cheriv9::rv64;
 #endif /* TARGET_RVxx */
 
 namespace po = boost::program_options;
+
+#if defined(TARGET_RV64)
+constexpr uint64_t GUIVP_CACHE_ACE_BASE = 0xE0000000ULL;
+constexpr uint64_t GUIVP_CACHE_ACE_AMO_BASE = GUIVP_CACHE_ACE_BASE + 0x0fffe000ULL;
+constexpr uint64_t GUIVP_CACHE_ACE_AMO_SIZE = 0x1000ULL;
+constexpr unsigned LINUX_BUS_TARGETS = 21;
+
+struct AmoAceWindowBridge : sc_core::sc_module {
+	tlm_utils::simple_target_socket<AmoAceWindowBridge> tgt_socket;
+	tlm_utils::simple_initiator_socket<AmoAceWindowBridge> ace_init_socket;
+	tlm_utils::simple_initiator_socket<AmoAceWindowBridge> mem_init_socket;
+	uint64_t global_base;
+
+	AmoAceWindowBridge(sc_core::sc_module_name name, uint64_t global_base)
+	    : sc_core::sc_module(name),
+	      tgt_socket("tgt_socket"),
+	      ace_init_socket("ace_init_socket"),
+	      mem_init_socket("mem_init_socket"),
+	      global_base(global_base) {
+		tgt_socket.register_b_transport(this, &AmoAceWindowBridge::b_transport);
+		tgt_socket.register_transport_dbg(this, &AmoAceWindowBridge::transport_dbg);
+	}
+
+	uint64_t translate(uint64_t addr) const {
+		return global_base + addr;
+	}
+
+	void b_transport(tlm::tlm_generic_payload &trans, sc_core::sc_time &delay) {
+		tlm_ext_atomic *atomic_ext = nullptr;
+		trans.get_extension(atomic_ext);
+
+		const uint64_t original = trans.get_address();
+		trans.set_address(translate(original));
+		// Linux probe uses normal stores to initialize the page; only real AMO
+		// instructions carry tlm_ext_atomic and should enter the ACE cache path.
+		if (atomic_ext && atomic_ext->is_amo) {
+			ace_init_socket->b_transport(trans, delay);
+		} else {
+			mem_init_socket->b_transport(trans, delay);
+		}
+		trans.set_address(original);
+	}
+
+	unsigned transport_dbg(tlm::tlm_generic_payload &trans) {
+		const uint64_t original = trans.get_address();
+		trans.set_address(translate(original));
+		const unsigned ret = mem_init_socket->transport_dbg(trans);
+		trans.set_address(original);
+		return ret;
+	}
+};
+
+struct LinuxMemoryBridge : sc_core::sc_module {
+	tlm_utils::simple_target_socket<LinuxMemoryBridge> main_tgt_socket;
+	tlm_utils::simple_target_socket<LinuxMemoryBridge> tgt_socket;
+	tlm_utils::simple_target_socket<LinuxMemoryBridge> global_tgt_socket;
+	tlm_utils::simple_initiator_socket<LinuxMemoryBridge> init_socket;
+	tlm_utils::simple_initiator_socket_optional<LinuxMemoryBridge> snoop_init_socket;
+	int64_t ace_address_delta;
+
+	LinuxMemoryBridge(sc_core::sc_module_name name, int64_t ace_address_delta)
+	    : sc_core::sc_module(name),
+	      main_tgt_socket("main_tgt_socket"),
+	      tgt_socket("tgt_socket"),
+	      global_tgt_socket("global_tgt_socket"),
+	      init_socket("init_socket"),
+	      snoop_init_socket("snoop_init_socket"),
+	      ace_address_delta(ace_address_delta) {
+		main_tgt_socket.register_b_transport(this, &LinuxMemoryBridge::b_transport_main);
+		main_tgt_socket.register_transport_dbg(this, &LinuxMemoryBridge::transport_dbg_main);
+		tgt_socket.register_b_transport(this, &LinuxMemoryBridge::b_transport_ace);
+		tgt_socket.register_transport_dbg(this, &LinuxMemoryBridge::transport_dbg_ace);
+		global_tgt_socket.register_b_transport(this, &LinuxMemoryBridge::b_transport_global);
+		global_tgt_socket.register_transport_dbg(this, &LinuxMemoryBridge::transport_dbg_global);
+	}
+
+	uint64_t translate_ace(uint64_t addr) const {
+		return static_cast<uint64_t>(static_cast<int64_t>(addr) + ace_address_delta);
+	}
+
+	void forward_to_memory(tlm::tlm_generic_payload &trans, sc_core::sc_time &delay) {
+		init_socket->b_transport(trans, delay);
+		// SimpleMemory copies data but leaves response incomplete; ACE cache fill
+		// requires an OK response before it can mark a ReadUnique line valid.
+		if (trans.get_response_status() == tlm::TLM_INCOMPLETE_RESPONSE) {
+			trans.set_response_status(tlm::TLM_OK_RESPONSE);
+		}
+	}
+
+	void b_transport_main(tlm::tlm_generic_payload &trans, sc_core::sc_time &delay) {
+		forward_to_memory(trans, delay);
+	}
+
+	unsigned transport_dbg_main(tlm::tlm_generic_payload &trans) {
+		return init_socket->transport_dbg(trans);
+	}
+
+	void b_transport_ace(tlm::tlm_generic_payload &trans, sc_core::sc_time &delay) {
+		const uint64_t original = trans.get_address();
+		trans.set_address(translate_ace(original));
+		forward_to_memory(trans, delay);
+		trans.set_address(original);
+	}
+
+	unsigned transport_dbg_ace(tlm::tlm_generic_payload &trans) {
+		const uint64_t original = trans.get_address();
+		trans.set_address(translate_ace(original));
+		const unsigned ret = init_socket->transport_dbg(trans);
+		trans.set_address(original);
+		return ret;
+	}
+
+	void b_transport_global(tlm::tlm_generic_payload &trans, sc_core::sc_time &delay) {
+		b_transport_ace(trans, delay);
+	}
+
+	unsigned transport_dbg_global(tlm::tlm_generic_payload &trans) {
+		return transport_dbg_ace(trans);
+	}
+};
+#else
+constexpr unsigned LINUX_BUS_TARGETS = 20;
+#endif
 
 struct LinuxOptions : public Options {
    public:
@@ -375,7 +506,7 @@ int sc_main(int argc, char **argv) {
 	if (opt.use_debug_bus) {
 		debug_bus = new NetTrace(opt.debug_bus_port);
 	}
-	SimpleBus<NUM_CORES + 1, 20> bus("SimpleBus", debug_bus, opt.break_on_transaction);
+	SimpleBus<NUM_CORES + 1, LINUX_BUS_TARGETS> bus("SimpleBus", debug_bus, opt.break_on_transaction);
 	SyscallHandler sys("SyscallHandler");
 	SIFIVE_PLIC plic("PLIC", true, NUM_CORES, 53);
 	LWRT_CLINT<NUM_CORES> clint("CLINT");
@@ -400,6 +531,11 @@ int sc_main(int argc, char **argv) {
 	DebugMemoryInterface dbg_if("DebugMemoryInterface");
 	MemoryMappedFile mramRoot("MRAM_Root", opt.mram_root_image, opt.mram_root_size);
 	MemoryMappedFile mramData("MRAM_Data", opt.mram_data_image, opt.mram_data_size);
+#if defined(TARGET_RV64)
+	ACEMaster<32768, 64> cache_ace_master("CacheAceMaster");
+	AmoAceWindowBridge cache_ace_amo_bridge("CacheAceAmoBridge", GUIVP_CACHE_ACE_AMO_BASE);
+	LinuxMemoryBridge linux_memory_bridge("LinuxMemoryBridge", -static_cast<int64_t>(opt.mem_start_addr));
+#endif
 
 	SPI_SD_Card spi_sd_card(&spi2, 0, &gpio, 11, false);
 	if (opt.sd_card_image.length()) {
@@ -447,28 +583,35 @@ int sc_main(int argc, char **argv) {
 	}
 
 	// setup port mapping
-	bus.ports[0] = new PortMapping(opt.mem_start_addr, opt.mem_end_addr, mem);
-	bus.ports[1] = new PortMapping(opt.clint_start_addr, opt.clint_end_addr, clint);
-	bus.ports[2] = new PortMapping(opt.sys_start_addr, opt.sys_end_addr, sys);
-	bus.ports[3] = new PortMapping(opt.dtb_rom_start_addr, opt.dtb_rom_end_addr, dtb_rom);
-	bus.ports[4] = new PortMapping(opt.uart0_start_addr, opt.uart0_end_addr, uart0);
-	bus.ports[5] = new PortMapping(opt.uart1_start_addr, opt.uart1_end_addr, slip);
-	bus.ports[6] = new PortMapping(opt.gpio_start_addr, opt.gpio_end_addr, gpio);
-	bus.ports[7] = new PortMapping(opt.spi0_start_addr, opt.spi0_end_addr, spi0);
-	bus.ports[8] = new PortMapping(opt.spi1_start_addr, opt.spi1_end_addr, spi1);
-	bus.ports[9] = new PortMapping(opt.spi2_start_addr, opt.spi2_end_addr, spi2);
-	bus.ports[10] = new PortMapping(opt.plic_start_addr, opt.plic_end_addr, plic);
-	bus.ports[11] = new PortMapping(opt.prci_start_addr, opt.prci_end_addr, prci);
-	bus.ports[12] = new PortMapping(opt.miscdev_start_addr, opt.miscdev_end_addr, miscdev);
-	bus.ports[13] = new PortMapping(opt.sifive_test_start_addr, opt.sifive_test_end_addr, sifive_test);
-	bus.ports[14] = new PortMapping(opt.vncsimplefb_start_addr, opt.vncsimplefb_end_addr, vncsimplefb);
-	bus.ports[15] =
+	unsigned bus_port = 0;
+#if defined(TARGET_RV64)
+	bus.ports[bus_port++] = new PortMapping(GUIVP_CACHE_ACE_AMO_BASE,
+	                                        GUIVP_CACHE_ACE_AMO_BASE + GUIVP_CACHE_ACE_AMO_SIZE - 1,
+	                                        cache_ace_amo_bridge);
+#endif
+	bus.ports[bus_port++] = new PortMapping(opt.mem_start_addr, opt.mem_end_addr, mem);
+	bus.ports[bus_port++] = new PortMapping(opt.clint_start_addr, opt.clint_end_addr, clint);
+	bus.ports[bus_port++] = new PortMapping(opt.sys_start_addr, opt.sys_end_addr, sys);
+	bus.ports[bus_port++] = new PortMapping(opt.dtb_rom_start_addr, opt.dtb_rom_end_addr, dtb_rom);
+	bus.ports[bus_port++] = new PortMapping(opt.uart0_start_addr, opt.uart0_end_addr, uart0);
+	bus.ports[bus_port++] = new PortMapping(opt.uart1_start_addr, opt.uart1_end_addr, slip);
+	bus.ports[bus_port++] = new PortMapping(opt.gpio_start_addr, opt.gpio_end_addr, gpio);
+	bus.ports[bus_port++] = new PortMapping(opt.spi0_start_addr, opt.spi0_end_addr, spi0);
+	bus.ports[bus_port++] = new PortMapping(opt.spi1_start_addr, opt.spi1_end_addr, spi1);
+	bus.ports[bus_port++] = new PortMapping(opt.spi2_start_addr, opt.spi2_end_addr, spi2);
+	bus.ports[bus_port++] = new PortMapping(opt.plic_start_addr, opt.plic_end_addr, plic);
+	bus.ports[bus_port++] = new PortMapping(opt.prci_start_addr, opt.prci_end_addr, prci);
+	bus.ports[bus_port++] = new PortMapping(opt.miscdev_start_addr, opt.miscdev_end_addr, miscdev);
+	bus.ports[bus_port++] = new PortMapping(opt.sifive_test_start_addr, opt.sifive_test_end_addr, sifive_test);
+	bus.ports[bus_port++] = new PortMapping(opt.vncsimplefb_start_addr, opt.vncsimplefb_end_addr, vncsimplefb);
+	bus.ports[bus_port++] =
 	    new PortMapping(opt.vncsimpleinputptr_start_addr, opt.vncsimpleinputptr_end_addr, vncsimpleinputptr);
-	bus.ports[16] =
+	bus.ports[bus_port++] =
 	    new PortMapping(opt.vncsimpleinputkbd_start_addr, opt.vncsimpleinputkbd_end_addr, vncsimpleinputkbd);
-	bus.ports[17] = new PortMapping(opt.mram_root_start_addr, opt.mram_root_end_addr, mramRoot);
-	bus.ports[18] = new PortMapping(opt.mram_data_start_addr, opt.mram_data_end_addr, mramData);
-	bus.ports[19] = new PortMapping(opt.i2c_start_addr, opt.i2c_end_addr, i2c);
+	bus.ports[bus_port++] = new PortMapping(opt.mram_root_start_addr, opt.mram_root_end_addr, mramRoot);
+	bus.ports[bus_port++] = new PortMapping(opt.mram_data_start_addr, opt.mram_data_end_addr, mramData);
+	bus.ports[bus_port++] = new PortMapping(opt.i2c_start_addr, opt.i2c_end_addr, i2c);
+	assert(bus_port == LINUX_BUS_TARGETS);
 	bus.mapping_complete();
 
 	// connect TLM sockets
@@ -476,26 +619,39 @@ int sc_main(int argc, char **argv) {
 		cores[i]->memif.isock.bind(bus.tsocks[i]);
 	}
 	dbg_if.isock.bind(bus.tsocks[NUM_CORES]);
-	bus.isocks[0].bind(mem.tsock);
-	bus.isocks[1].bind(clint.tsock);
-	bus.isocks[2].bind(sys.tsock);
-	bus.isocks[3].bind(dtb_rom.tsock);
-	bus.isocks[4].bind(uart0.tsock);
-	bus.isocks[5].bind(slip.tsock);
-	bus.isocks[6].bind(gpio.tsock);
-	bus.isocks[7].bind(spi0.tsock);
-	bus.isocks[8].bind(spi1.tsock);
-	bus.isocks[9].bind(spi2.tsock);
-	bus.isocks[10].bind(plic.tsock);
-	bus.isocks[11].bind(prci.tsock);
-	bus.isocks[12].bind(miscdev.tsock);
-	bus.isocks[13].bind(sifive_test.tsock);
-	bus.isocks[14].bind(vncsimplefb.tsock);
-	bus.isocks[15].bind(vncsimpleinputptr.tsock);
-	bus.isocks[16].bind(vncsimpleinputkbd.tsock);
-	bus.isocks[17].bind(mramRoot.tsock);
-	bus.isocks[18].bind(mramData.tsock);
-	bus.isocks[19].bind(i2c.tsock);
+	bus_port = 0;
+#if defined(TARGET_RV64)
+	bus.isocks[bus_port++].bind(cache_ace_amo_bridge.tgt_socket);
+	cache_ace_amo_bridge.ace_init_socket.bind(cache_ace_master.cpu_target_socket());
+	cache_ace_amo_bridge.mem_init_socket.bind(linux_memory_bridge.global_tgt_socket);
+	cache_ace_master.connect(linux_memory_bridge);
+	linux_memory_bridge.init_socket.bind(mem.tsock);
+#endif
+#if defined(TARGET_RV64)
+	bus.isocks[bus_port++].bind(linux_memory_bridge.main_tgt_socket);
+#else
+	bus.isocks[bus_port++].bind(mem.tsock);
+#endif
+	bus.isocks[bus_port++].bind(clint.tsock);
+	bus.isocks[bus_port++].bind(sys.tsock);
+	bus.isocks[bus_port++].bind(dtb_rom.tsock);
+	bus.isocks[bus_port++].bind(uart0.tsock);
+	bus.isocks[bus_port++].bind(slip.tsock);
+	bus.isocks[bus_port++].bind(gpio.tsock);
+	bus.isocks[bus_port++].bind(spi0.tsock);
+	bus.isocks[bus_port++].bind(spi1.tsock);
+	bus.isocks[bus_port++].bind(spi2.tsock);
+	bus.isocks[bus_port++].bind(plic.tsock);
+	bus.isocks[bus_port++].bind(prci.tsock);
+	bus.isocks[bus_port++].bind(miscdev.tsock);
+	bus.isocks[bus_port++].bind(sifive_test.tsock);
+	bus.isocks[bus_port++].bind(vncsimplefb.tsock);
+	bus.isocks[bus_port++].bind(vncsimpleinputptr.tsock);
+	bus.isocks[bus_port++].bind(vncsimpleinputkbd.tsock);
+	bus.isocks[bus_port++].bind(mramRoot.tsock);
+	bus.isocks[bus_port++].bind(mramData.tsock);
+	bus.isocks[bus_port++].bind(i2c.tsock);
+	assert(bus_port == LINUX_BUS_TARGETS);
 
 	// connect interrupt signals/communication
 	for (size_t i = 0; i < NUM_CORES; i++) {

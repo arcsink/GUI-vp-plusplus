@@ -1169,7 +1169,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(AMOSWAP_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOSwap, [](int32_t a, int32_t b) {
+					execute_amo_w(instr, PmaAmoClass::AMOSwap, TlmAmoOp::Swap, [](int32_t a, int32_t b) {
 						(void)a;
 						return b;
 					});
@@ -1177,43 +1177,43 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(AMOADD_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return a + b; });
+					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, TlmAmoOp::Add, [](int32_t a, int32_t b) { return a + b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOXOR_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOLogical, [](int32_t a, int32_t b) { return a ^ b; });
+					execute_amo_w(instr, PmaAmoClass::AMOLogical, TlmAmoOp::Xor, [](int32_t a, int32_t b) { return a ^ b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOAND_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOLogical, [](int32_t a, int32_t b) { return a & b; });
+					execute_amo_w(instr, PmaAmoClass::AMOLogical, TlmAmoOp::And, [](int32_t a, int32_t b) { return a & b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOOR_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOLogical, [](int32_t a, int32_t b) { return a | b; });
+					execute_amo_w(instr, PmaAmoClass::AMOLogical, TlmAmoOp::Or, [](int32_t a, int32_t b) { return a | b; });
 				}
 				OP_END();
 
 				OP_CASE(AMOMIN_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return std::min(a, b); });
+					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, TlmAmoOp::MinSigned, [](int32_t a, int32_t b) { return std::min(a, b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMINU_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic,
+					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, TlmAmoOp::MinUnsigned,
 					              [](int32_t a, int32_t b) { return std::min((uint32_t)a, (uint32_t)b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMAX_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, [](int32_t a, int32_t b) { return std::max(a, b); });
+					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, TlmAmoOp::MaxSigned, [](int32_t a, int32_t b) { return std::max(a, b); });
 				}
 				OP_END();
 
 				OP_CASE(AMOMAXU_W) {
-					execute_amo_w(instr, PmaAmoClass::AMOArithmetic,
+					execute_amo_w(instr, PmaAmoClass::AMOArithmetic, TlmAmoOp::MaxUnsigned,
 					              [](int32_t a, int32_t b) { return std::max((uint32_t)a, (uint32_t)b); });
 				}
 				OP_END();

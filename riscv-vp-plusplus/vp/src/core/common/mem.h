@@ -7,6 +7,7 @@
 #include "mmu.h"
 #include "pma.h"
 #include "util/propertytree.h"
+#include "util/tlm_ext_atomic.h"
 #include "util/tlm_ext_initiator.h"
 
 /*
@@ -61,6 +62,9 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	uint64_t lr_addr = 0;
 	PMA pma;
 	PmaAmoClass next_amo_class = PmaAmoClass::AMOArithmetic;
+	TlmAmoOp next_amo_op = TlmAmoOp::None;
+	bool next_amo_aq = false;
+	bool next_amo_rl = false;
 
 	tlm_utils::simple_initiator_socket<CombinedMemoryInterface_T> isock;
 	tlm_utils::tlm_quantumkeeper &quantum_keeper;
@@ -71,6 +75,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 
 	tlm::tlm_generic_payload trans;
 	tlm_ext_initiator *ext;
+	tlm_ext_atomic *atomic_ext;
 
 	MMU_T<T_RVX_ISS> *mmu;
 
@@ -92,7 +97,9 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 
 		ext = new tlm_ext_initiator(&owner);  // tlm_generic_payload frees all extension objects in destructor,
 		                                      // therefore dynamic allocation is needed
+		atomic_ext = new tlm_ext_atomic();
 		trans.set_extension<tlm_ext_initiator>(ext);
+		trans.set_extension<tlm_ext_atomic>(atomic_ext);
 	}
 
 	uint64_t v2p(uint64_t vaddr, MemoryAccessType type) override {
@@ -153,12 +160,20 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		}
 	}
 
-	inline void _do_transaction(tlm::tlm_command cmd, uint64_t addr, uint8_t *data, unsigned num_bytes) {
+	inline void _do_transaction(tlm::tlm_command cmd, uint64_t addr, uint8_t *data, unsigned num_bytes,
+	                            bool atomic = false, bool lr_sc = false, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                            TlmAtomicPhase atomic_phase = TlmAtomicPhase::None) {
 		trans.set_command(cmd);
 		trans.set_address(addr);
 		trans.set_data_ptr(data);
 		trans.set_data_length(num_bytes);
 		trans.set_response_status(tlm::TLM_OK_RESPONSE);
+		atomic_ext->clear();
+		if (atomic && !lr_sc) {
+			// Keep AMO identity on both the read and write halves so master-ACE/cache-ACE can choose
+			// unique-line RMW handling instead of treating them as unrelated normal accesses.
+			atomic_ext->set_amo(atomic_phase, next_amo_op, amo_class, next_amo_aq, next_amo_rl);
+		}
 
 		/* ensure, that quantum_keeper value of ISS is up-to-date */
 		iss.commit_cycles();
@@ -211,7 +226,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			}
 		}
 
-		_do_transaction(tlm::TLM_READ_COMMAND, addr, (uint8_t *)&ans, sizeof(T));
+		_do_transaction(tlm::TLM_READ_COMMAND, addr, (uint8_t *)&ans, sizeof(T), atomic, lr_sc, amo_class,
+		                atomic ? TlmAtomicPhase::Load : TlmAtomicPhase::None);
 
 		/*
 		 * A transaction may lead to a context switch. The other context may issue transaction handled via dmi.
@@ -247,7 +263,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			}
 		}
 
-		_do_transaction(tlm::TLM_WRITE_COMMAND, addr, (uint8_t *)&value, sizeof(T));
+		_do_transaction(tlm::TLM_WRITE_COMMAND, addr, (uint8_t *)&value, sizeof(T), atomic, lr_sc, amo_class,
+		                atomic ? TlmAtomicPhase::Store : TlmAtomicPhase::None);
 		atomic_unlock();
 
 		/* see comment in _raw_load_data */
@@ -398,6 +415,9 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		}
 		_store_data(addr, value, true, false, next_amo_class);
 		next_amo_class = PmaAmoClass::AMOArithmetic;
+		next_amo_op = TlmAmoOp::None;
+		next_amo_aq = false;
+		next_amo_rl = false;
 	}
 	template <typename T>
 	T _atomic_load_reserved_data(uint64_t addr) {
@@ -530,6 +550,16 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 
 	void set_next_amo_class(PmaAmoClass amo_class) override {
 		next_amo_class = amo_class;
+		next_amo_op = TlmAmoOp::None;
+		next_amo_aq = false;
+		next_amo_rl = false;
+	}
+
+	void set_next_amo(PmaAmoClass amo_class, TlmAmoOp amo_op, bool aq, bool rl) override {
+		next_amo_class = amo_class;
+		next_amo_op = amo_op;
+		next_amo_aq = aq;
+		next_amo_rl = rl;
 	}
 
 	void atomic_unlock() override {

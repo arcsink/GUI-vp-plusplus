@@ -56,6 +56,8 @@ add_test(NAME sw
 	COMMAND ./test.sh
 	WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../sw")
 
+add_subdirectory(tests/master_ace_amo)
+
 set_tests_properties(gdb integration sw PROPERTIES ENVIRONMENT
 	PATH=$ENV{PATH}:${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 set_tests_properties(libgdb PROPERTIES ENVIRONMENT
