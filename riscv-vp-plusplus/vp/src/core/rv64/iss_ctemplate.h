@@ -245,12 +245,13 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
-	inline void execute_amo_w(Instruction &instr, std::function<int32_t(int32_t, int32_t)> operation) {
+	inline void execute_amo_w(Instruction &instr, PmaAmoClass amo_class,
+	                          std::function<int32_t(int32_t, int32_t)> operation) {
 		stats.inc_amo();
 		uxlen_t addr = regs[instr.rs1()];
-		trap_check_addr_alignment<4, false>(addr);
 		int32_t data;
 		try {
+			mem->set_next_amo_class(amo_class);
 			data = mem->atomic_load_word(addr);
 		} catch (SimulationTrap &e) {
 			if (e.reason == EXC_LOAD_ACCESS_FAULT)
@@ -265,11 +266,12 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
-	inline void execute_amo_d(Instruction &instr, std::function<int64_t(int64_t, int64_t)> operation) {
+	inline void execute_amo_d(Instruction &instr, PmaAmoClass amo_class,
+	                          std::function<int64_t(int64_t, int64_t)> operation) {
 		uxlen_t addr = regs[instr.rs1()];
-		trap_check_addr_alignment<8, false>(addr);
 		uint64_t data;
 		try {
+			mem->set_next_amo_class(amo_class);
 			data = mem->atomic_load_double(addr);
 		} catch (SimulationTrap &e) {
 			if (e.reason == EXC_LOAD_ACCESS_FAULT)

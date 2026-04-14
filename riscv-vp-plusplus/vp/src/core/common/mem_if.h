@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "core/common_cheriv9/cheri_capability.h"
+#include "core/common/pma.h"
 
 struct instr_memory_if {
 	virtual uint32_t load_instr(uint64_t pc) = 0;
@@ -111,6 +112,10 @@ struct data_memory_if_T {
 	virtual void atomic_store_double(uint64_t addr, uint64_t value) = 0;
 	virtual int64_t atomic_load_reserved_double(uint64_t addr) = 0;
 	virtual bool atomic_store_conditional_double(uint64_t addr, uint64_t value) = 0;
+
+	virtual void set_next_amo_class(PmaAmoClass amo_class) {
+		(void)amo_class;
+	}
 
 	/* returns true if the bus is locked */
 	virtual bool is_bus_locked() = 0;

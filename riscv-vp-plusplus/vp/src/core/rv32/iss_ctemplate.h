@@ -69,6 +69,7 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	PrivilegeLevel prv = MachineMode;
 	bool virt = false;
 	bool trap_to_virtual_supervisor = false;
+	bool guest_mmio_debug = false;
 
 	// last decoded and executed instruction
 	Instruction instr;
@@ -153,6 +154,9 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		trace = ena;
 		force_slow_path();
 	}
+	void enable_early_boot_debug(uxlen_t, uxlen_t, uxlen_t, uint32_t) {
+		// H Extension fdw: RV32 keeps the shared Linux platform early-boot hook as a no-op.
+	}
 	void enable_guest_mmio_debug(uxlen_t, uxlen_t, uint32_t) {
 		// H Extension fdw: keep the common memory-interface guest-MMIO debug hooks compile-safe on RV32 even though the current L2 bring-up debugging only targets RV64.
 	}
@@ -162,8 +166,14 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	bool should_log_guest_mmio_access(uxlen_t) const {
 		return false;
 	}
+	bool should_log_guest_fetch_xlate(uxlen_t) const {
+		return false;
+	}
 	void log_guest_mmio_access(const char *, uxlen_t, uxlen_t, unsigned, uint64_t) {
 		// H Extension fdw: RV32 has no guest-MMIO trace output today; provide a no-op shim so shared templates stay architecture-agnostic.
+	}
+	void log_guest_fetch_xlate(uxlen_t, uxlen_t, uint32_t) {
+		// H Extension fdw: RV32 does not emit guest fetch translation traces.
 	}
 	void maybe_log_guest_exec_progress() {
 		// H Extension fdw: keep the shared guest-exec trace hook compile-safe on RV32 without introducing extra trace output.
@@ -229,12 +239,13 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
-	inline void execute_amo_w(Instruction &instr, std::function<int32_t(int32_t, int32_t)> operation) {
+	inline void execute_amo_w(Instruction &instr, PmaAmoClass amo_class,
+	                          std::function<int32_t(int32_t, int32_t)> operation) {
 		stats.inc_amo();
 		uxlen_t addr = regs[instr.rs1()];
-		trap_check_addr_alignment<4, false>(addr);
 		int32_t data;
 		try {
+			mem->set_next_amo_class(amo_class);
 			data = mem->atomic_load_word(addr);
 		} catch (SimulationTrap &e) {
 			if (e.reason == EXC_LOAD_ACCESS_FAULT)

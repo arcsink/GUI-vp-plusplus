@@ -271,6 +271,66 @@ void handle_kernel_file(const LinuxOptions opt, load_if &mem) {
 	}
 }
 
+#ifndef TARGET_RV64_CHERIV9
+template <typename TCore>
+void configure_guivp_cache_ace_pma(TCore &core) {
+	constexpr uint64_t cache_ace_base = 0xE0000000ULL;
+	constexpr uint64_t pma_mag_offset = 0x0fffc000ULL;
+	constexpr uint64_t pma_rsrv_none_offset = 0x0fffd000ULL;
+	constexpr uint64_t pma_amo_logical_offset = 0x0fffe000ULL;
+	constexpr uint64_t pma_deny_offset = 0x0ffff000ULL;
+	constexpr uint64_t nc_offset = 0x10000000ULL;
+	constexpr uint64_t io_offset = 0x18000000ULL;
+	constexpr uint64_t window_size = 0x20000000ULL;
+	constexpr uint64_t region_page = 0x1000ULL;
+
+	pma_attributes nc;
+	nc.cacheable = false;
+	nc.coherent = false;
+
+	pma_attributes io = nc;
+	io.memory_type = PmaMemoryType::IO;
+	io.ordering = PmaOrdering::StrongIO;
+	io.amo_class = PmaAmoClass::AMONone;
+	io.reservability = PmaReservability::RsrvNone;
+
+	pma_attributes mag;
+	mag.misaligned_atomicity_granule = 16;
+
+	pma_attributes rsrv_none;
+	rsrv_none.reservability = PmaReservability::RsrvNone;
+
+	pma_attributes amo_logical;
+	amo_logical.amo_class = PmaAmoClass::AMOLogical;
+
+	pma_access_widths no_access = {
+	    false,
+	    false,
+	    false,
+	    false,
+	    false,
+	    false,
+	};
+	pma_attributes deny;
+	deny.read = no_access;
+	deny.write = no_access;
+	deny.execute = no_access;
+	deny.page_table_read = false;
+	deny.page_table_write = false;
+	deny.amo_class = PmaAmoClass::AMONone;
+	deny.reservability = PmaReservability::RsrvNone;
+	deny.cacheable = false;
+	deny.coherent = false;
+
+	core.memif.pma.set_region(cache_ace_base + pma_mag_offset, region_page, mag, MachineMode);
+	core.memif.pma.set_region(cache_ace_base + pma_rsrv_none_offset, region_page, rsrv_none, MachineMode);
+	core.memif.pma.set_region(cache_ace_base + pma_amo_logical_offset, region_page, amo_logical, MachineMode);
+	core.memif.pma.set_region(cache_ace_base + pma_deny_offset, region_page, deny, MachineMode);
+	core.memif.pma.set_region(cache_ace_base + nc_offset, io_offset - nc_offset, nc, MachineMode);
+	core.memif.pma.set_region(cache_ace_base + io_offset, window_size - io_offset, io, MachineMode);
+}
+#endif
+
 int sc_main(int argc, char **argv) {
 	// PropertyTree::global()->set_debug(true);
 
@@ -362,6 +422,9 @@ int sc_main(int argc, char **argv) {
 
 		cores[i]->memif.bus_lock = bus_lock;
 		cores[i]->mmu.mem = &cores[i]->memif;
+#ifndef TARGET_RV64_CHERIV9
+		configure_guivp_cache_ace_pma(*cores[i]);
+#endif
 
 		// enable interactive debug via console
 		channel_console.debug_targets_add(&cores[i]->iss);

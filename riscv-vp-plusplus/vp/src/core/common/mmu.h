@@ -23,6 +23,7 @@ constexpr unsigned PTE_G = 1 << 5;
 constexpr unsigned PTE_A = 1 << 6;
 constexpr unsigned PTE_D = 1 << 7;
 constexpr unsigned PTE_RSW = 0b11 << 8;
+constexpr uint64_t PTE_PPN_MASK = 0x003FFFFFFFFFFC00ULL;
 
 constexpr unsigned PMP_R = 0x01;
 constexpr unsigned PMP_W = 0x02;
@@ -60,6 +61,10 @@ struct pte_t {
 	}
 	bool D() {
 		return value & PTE_D;
+	}
+
+	uint64_t PPN() const {
+		return (value & PTE_PPN_MASK) >> PTE_PPN_SHIFT;
 	}
 
 	operator uint64_t() {
@@ -458,7 +463,7 @@ struct MMU_T {
 				          << std::endl;
 			}
 
-			uint64_t ppn = pte >> PTE_PPN_SHIFT;
+			uint64_t ppn = pte.PPN();
 			if (!pte.V() || (!pte.R() && pte.W()))
 				break;
 
@@ -561,7 +566,7 @@ struct MMU_T {
 			else
 				pte.value = mem->mmu_load_pte64(pte_paddr);
 
-			uint64_t ppn = pte >> PTE_PPN_SHIFT;
+			uint64_t ppn = pte.PPN();
 
 			if (!pte.V() || (!pte.R() && pte.W())) {
 				// std::cout << "[mmu] !pte.V() || (!pte.R() && pte.W())" << std::endl;

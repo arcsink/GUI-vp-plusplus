@@ -5,6 +5,7 @@
 #include "dmi.h"
 #include "mem_if.h"
 #include "mmu.h"
+#include "pma.h"
 #include "util/propertytree.h"
 #include "util/tlm_ext_initiator.h"
 
@@ -58,6 +59,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	T_RVX_ISS &iss;
 	std::shared_ptr<bus_lock_if> bus_lock;
 	uint64_t lr_addr = 0;
+	PMA pma;
+	PmaAmoClass next_amo_class = PmaAmoClass::AMOArithmetic;
 
 	tlm_utils::simple_initiator_socket<CombinedMemoryInterface_T> isock;
 	tlm_utils::tlm_quantumkeeper &quantum_keeper;
@@ -117,6 +120,39 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		return flags;
 	}
 
+	void check_pma_or_trap(uint64_t addr, uint64_t size, MemoryAccessType type, bool atomic = false,
+	                       bool lr_sc = false, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                       PmaReservability reservability = PmaReservability::RsrvNonEventual,
+	                       bool page_table_access = false, bool implicit = false) {
+		pma_check_request request;
+		request.paddr = addr;
+		request.size = size;
+		request.access_type = type;
+		request.atomic = atomic;
+		request.lr_sc = lr_sc;
+		request.amo_class = amo_class;
+		request.reservability = reservability;
+		request.page_table_access = page_table_access;
+		request.implicit = implicit;
+
+		const auto result = pma.check_access(request);
+		if (result.allowed) {
+			return;
+		}
+
+		switch (type) {
+			case FETCH:
+				raise_trap(EXC_INSTR_ACCESS_FAULT, addr);
+				break;
+			case LOAD:
+				raise_trap(EXC_LOAD_ACCESS_FAULT, addr);
+				break;
+			case STORE:
+				raise_trap(EXC_STORE_AMO_ACCESS_FAULT, addr);
+				break;
+		}
+	}
+
 	inline void _do_transaction(tlm::tlm_command cmd, uint64_t addr, uint8_t *data, unsigned num_bytes) {
 		trans.set_command(cmd);
 		trans.set_address(addr);
@@ -149,7 +185,13 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline T _raw_load_data(uint64_t addr) {
+	inline T _raw_load_data(uint64_t addr, MemoryAccessType access_type = LOAD, bool atomic = false,
+	                        bool lr_sc = false, PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                        PmaReservability reservability = PmaReservability::RsrvNonEventual,
+	                        bool page_table_access = false, bool implicit = false) {
+		check_pma_or_trap(addr, sizeof(T), access_type, atomic, lr_sc, amo_class, reservability, page_table_access,
+		                  implicit);
+
 		// NOTE: a DMI load will not context switch (SystemC) and not modify the memory, hence should be able to
 		// postpone the lock after the dmi access
 		bus_lock->wait_for_access_rights(iss.get_hart_id());
@@ -182,7 +224,13 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline void _raw_store_data(uint64_t addr, T value) {
+	inline void _raw_store_data(uint64_t addr, T value, bool atomic = false, bool lr_sc = false,
+	                            PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                            PmaReservability reservability = PmaReservability::RsrvNonEventual,
+	                            bool page_table_access = false, bool implicit = false) {
+		check_pma_or_trap(addr, sizeof(T), STORE, atomic, lr_sc, amo_class, reservability, page_table_access,
+		                  implicit);
+
 		bus_lock->wait_for_access_rights(iss.get_hart_id());
 
 		for (auto &e : dmi_ranges) {
@@ -207,9 +255,11 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline T _load_data(uint64_t addr) {
+	inline T _load_data(uint64_t addr, bool atomic = false, bool lr_sc = false,
+	                    PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                    PmaReservability reservability = PmaReservability::RsrvNonEventual) {
 		auto paddr = v2p(addr, LOAD);
-		T value = _raw_load_data<T>(paddr);
+		T value = _raw_load_data<T>(paddr, LOAD, atomic, lr_sc, amo_class, reservability);
 		if (iss.should_log_guest_mmio_access(paddr)) {
 			// H Extension fdw: sample translated guest loads at the common memory interface so L2 UART/debug MMIO can be observed regardless of the calling instruction path.
 			iss.log_guest_mmio_access("load", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
@@ -218,9 +268,11 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline T _load_data(uint64_t addr, xlate_flags_t flags) {
+	inline T _load_data(uint64_t addr, xlate_flags_t flags, bool atomic = false, bool lr_sc = false,
+	                    PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                    PmaReservability reservability = PmaReservability::RsrvNonEventual) {
 		auto paddr = v2p(addr, LOAD, flags);
-		T value = _raw_load_data<T>(paddr);
+		T value = _raw_load_data<T>(paddr, LOAD, atomic, lr_sc, amo_class, reservability);
 		if (iss.should_log_guest_mmio_access(paddr)) {
 			// H Extension fdw: keep forced guest-translation accesses visible too, because HLV/HSV and nested-guest bring-up reuse the same translated data path.
 			iss.log_guest_mmio_access("load", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
@@ -229,33 +281,40 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 
 	template <typename T>
-	inline void _store_data(uint64_t addr, T value) {
+	inline void _store_data(uint64_t addr, T value, bool atomic = false, bool lr_sc = false,
+	                        PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                        PmaReservability reservability = PmaReservability::RsrvNonEventual) {
 		auto paddr = v2p(addr, STORE);
 		if (iss.should_log_guest_mmio_access(paddr)) {
 			// H Extension fdw: log translated guest stores before the transaction so silent UART writes can still be recovered even if the downstream device path is broken.
 			iss.log_guest_mmio_access("store", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
 		}
-		_raw_store_data(paddr, value);
+		_raw_store_data(paddr, value, atomic, lr_sc, amo_class, reservability);
 	}
 
 	template <typename T>
-	inline void _store_data(uint64_t addr, T value, xlate_flags_t flags) {
+	inline void _store_data(uint64_t addr, T value, xlate_flags_t flags, bool atomic = false, bool lr_sc = false,
+	                        PmaAmoClass amo_class = PmaAmoClass::AMOArithmetic,
+	                        PmaReservability reservability = PmaReservability::RsrvNonEventual) {
 		auto paddr = v2p(addr, STORE, flags);
 		if (iss.should_log_guest_mmio_access(paddr)) {
 			// H Extension fdw: mirror guest-store logging for forced guest translations so debug output stays consistent across nested translation entry points.
 			iss.log_guest_mmio_access("store", addr, paddr, sizeof(T), static_cast<uint64_t>(value));
 		}
-		_raw_store_data(paddr, value);
+		_raw_store_data(paddr, value, atomic, lr_sc, amo_class, reservability);
 	}
 
 	uint64_t mmu_load_pte64(uint64_t addr) override {
-		return _raw_load_data<uint64_t>(addr);
+		return _raw_load_data<uint64_t>(addr, LOAD, false, false, PmaAmoClass::AMOArithmetic,
+		                                PmaReservability::RsrvNonEventual, true, true);
 	}
 	uint64_t mmu_load_pte32(uint64_t addr) override {
-		return _raw_load_data<uint32_t>(addr);
+		return _raw_load_data<uint32_t>(addr, LOAD, false, false, PmaAmoClass::AMOArithmetic,
+		                                PmaReservability::RsrvNonEventual, true, true);
 	}
 	void mmu_store_pte32(uint64_t addr, uint32_t value) override {
-		_raw_store_data(addr, value);
+		_raw_store_data(addr, value, false, false, PmaAmoClass::AMOArithmetic,
+		                PmaReservability::RsrvNonEventual, true, true);
 	}
 
 	void flush_tlb() override {
@@ -291,7 +350,12 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		if ((addr & 0xFFF) == 0xFFE) {
 			uint64_t paddr_lo = v2p(addr + 0, FETCH);
 			uint64_t paddr_hi = v2p(addr + 2, FETCH);
-			uint32_t raw = (_raw_load_data<uint16_t>(paddr_hi) << 16) | (_raw_load_data<uint16_t>(paddr_lo) << 0);
+			uint32_t raw = (_raw_load_data<uint16_t>(paddr_hi, FETCH, false, false, PmaAmoClass::AMOArithmetic,
+			                                         PmaReservability::RsrvNonEventual, false, true)
+			                << 16) |
+			               (_raw_load_data<uint16_t>(paddr_lo, FETCH, false, false, PmaAmoClass::AMOArithmetic,
+			                                         PmaReservability::RsrvNonEventual, false, true)
+			                << 0);
 			if (iss.should_log_guest_fetch_xlate(addr)) {
 				// H Extension fdw: keep guest fetch translation logs valid even for split page-boundary fetches by reporting the low-half translated address together with the reconstructed 32-bit word.
 				iss.log_guest_fetch_xlate(addr, paddr_lo, raw);
@@ -300,7 +364,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		}
 
 		uint64_t paddr = v2p(addr, FETCH);
-		uint32_t raw = _raw_load_data<uint32_t>(paddr);
+		uint32_t raw = _raw_load_data<uint32_t>(paddr, FETCH, false, false, PmaAmoClass::AMOArithmetic,
+		                                        PmaReservability::RsrvNonEventual, false, true);
 		if (iss.should_log_guest_fetch_xlate(addr)) {
 			// H Extension fdw: log the guest fetch VA->PA mapping at the point of instruction load so Spike/VP++ entry mismatches can be localized before decode or branch execution.
 			iss.log_guest_fetch_xlate(addr, paddr, raw);
@@ -318,7 +383,7 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	template <typename T>
 	T _atomic_load_data(uint64_t addr) {
 		bus_lock->lock(iss.get_hart_id());
-		return _load_data<T>(addr);
+		return _load_data<T>(addr, true, false, next_amo_class);
 	}
 	template <typename T>
 	void _atomic_store_data(uint64_t addr, T value) {
@@ -331,22 +396,27 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			             "developers)"
 			          << std::endl;
 		}
-		_store_data(addr, value);
+		_store_data(addr, value, true, false, next_amo_class);
+		next_amo_class = PmaAmoClass::AMOArithmetic;
 	}
 	template <typename T>
 	T _atomic_load_reserved_data(uint64_t addr) {
 		bus_lock->lock(iss.get_hart_id());
 		lr_addr = addr;
-		return _load_data<T>(addr);
+		return _load_data<T>(addr, true, true, PmaAmoClass::AMOArithmetic, PmaReservability::RsrvNonEventual);
 	}
 	template <typename T>
 	bool _atomic_store_conditional_data(uint64_t addr, T value) {
+		auto paddr = v2p(addr, STORE);
+		check_pma_or_trap(paddr, sizeof(T), STORE, true, true, PmaAmoClass::AMOArithmetic,
+		                  PmaReservability::RsrvNonEventual);
+
 		/* According to the RISC-V ISA, an implementation can fail each LR/SC sequence that does not satisfy the forward
 		 * progress semantic.
 		 * The lock is established by the LR instruction and the lock is kept while forward progress is maintained. */
 		if (bus_lock->is_locked(iss.get_hart_id())) {
 			if (addr == lr_addr) {
-				_store_data(addr, value);
+				_store_data(addr, value, true, true, PmaAmoClass::AMOArithmetic, PmaReservability::RsrvNonEventual);
 				return true;
 			}
 			atomic_unlock();
@@ -456,6 +526,10 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	}
 	bool atomic_store_conditional_double(uint64_t addr, uint64_t value) override {
 		return _atomic_store_conditional_data(addr, value);
+	}
+
+	void set_next_amo_class(PmaAmoClass amo_class) override {
+		next_amo_class = amo_class;
 	}
 
 	void atomic_unlock() override {
