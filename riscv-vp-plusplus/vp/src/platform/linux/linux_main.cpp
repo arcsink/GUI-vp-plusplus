@@ -150,9 +150,9 @@ struct AmoAceWindowBridge : sc_core::sc_module {
 
 		const uint64_t original = trans.get_address();
 		trans.set_address(translate(original));
-		// Linux probe uses normal stores to initialize the page; only real AMO
-		// instructions carry tlm_ext_atomic and should enter the ACE cache path.
-		if (atomic_ext && atomic_ext->is_amo) {
+		// Linux probe uses normal stores to initialize the page; only real
+		// atomic instructions carry tlm_ext_atomic and should enter ACE cache.
+		if (atomic_ext && (atomic_ext->is_amo || atomic_ext->is_lr || atomic_ext->is_sc)) {
 			ace_init_socket->b_transport(trans, delay);
 		} else {
 			mem_init_socket->b_transport(trans, delay);

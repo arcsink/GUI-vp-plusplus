@@ -9,8 +9,8 @@ three regions using PMA, NC, and IO mappings. A boot-time self-test makes
 it easy to observe all cases without userspace.
 ---
  drivers/misc/Makefile          |  1 +
- drivers/misc/guivp_pbmt_test.c | 496 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 497 insertions(+)
+ drivers/misc/guivp_pbmt_test.c | 748 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 749 insertions(+)
  create mode 100644 drivers/misc/guivp_pbmt_test.c
 
 diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
@@ -30,7 +30,7 @@ new file mode 100644
 index 000000000000..6cb8454024a1
 --- /dev/null
 +++ b/drivers/misc/guivp_pbmt_test.c
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,748 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * GUI-VP PBMT test device
@@ -45,9 +45,12 @@ index 000000000000..6cb8454024a1
 + * without requiring a userspace helper.
 + */
 +
++#include <linux/completion.h>
++#include <linux/cpumask.h>
 +#include <linux/fs.h>
 +#include <linux/io.h>
 +#include <linux/kernel.h>
++#include <linux/kthread.h>
 +#include <linux/miscdevice.h>
 +#include <linux/mm.h>
 +#include <linux/module.h>
@@ -56,6 +59,7 @@ index 000000000000..6cb8454024a1
 +#include <linux/types.h>
 +#include <linux/uaccess.h>
 +#include <asm/asm-extable.h>
++#include <asm/processor.h>
 +
 +#define GUIVP_PBMT_TEST_NAME "guivp_pbmt_test"
 +#define GUIVP_CACHE_ACE_RMEM_PATH "/reserved-memory/cache-ace@e0000000"
@@ -67,6 +71,7 @@ index 000000000000..6cb8454024a1
 +#define GUIVP_REGION_NC_OFFSET 0x10000000ULL
 +#define GUIVP_REGION_IO_OFFSET 0x18000000ULL
 +#define GUIVP_REGION_END_OFFSET 0x20000000ULL
++#define GUIVP_LRSC_MUTEX_ATTEMPTS 256
 +
 +struct guivp_pbmt_test_ctx {
 +	struct miscdevice miscdev;
@@ -110,6 +115,53 @@ index 000000000000..6cb8454024a1
 +		: [value] "r" (value)
 +		: "memory");
 +
++	*status = sc_status;
++	return ret;
++}
++
++static int guivp_pbmt_lrsc_nofault(void __iomem *addr, u64 value, u64 *old, u64 *status)
++{
++	long ret = 0;
++	u64 oldval = 0;
++	u64 sc_status = 1;
++
++	asm volatile(
++		"1: lr.d.aqrl %[old], %[mem]\n"
++		"2: sc.d.aqrl %[status], %[value], %[mem]\n"
++		"3:\n"
++		_ASM_EXTABLE_UACCESS_ERR(1b, 3b, %[ret])
++		_ASM_EXTABLE_UACCESS_ERR(2b, 3b, %[ret])
++		: [ret] "+r" (ret), [old] "=&r" (oldval),
++		  [status] "=&r" (sc_status), [mem] "+A" (*(u64 __force *)addr)
++		: [value] "r" (value)
++		: "memory");
++
++	*old = oldval;
++	*status = sc_status;
++	return ret;
++}
++
++static int guivp_pbmt_lrsc_hold_nofault(void __iomem *addr, u64 value, u64 *old, u64 *status)
++{
++	long ret = 0;
++	u64 oldval = 0;
++	u64 sc_status = 1;
++
++	asm volatile(
++		"1: lr.d.aqrl %[old], %[mem]\n"
++		".rept 12\n"
++		"nop\n"
++		".endr\n"
++		"2: sc.d.aqrl %[status], %[value], %[mem]\n"
++		"3:\n"
++		_ASM_EXTABLE_UACCESS_ERR(1b, 3b, %[ret])
++		_ASM_EXTABLE_UACCESS_ERR(2b, 3b, %[ret])
++		: [ret] "+r" (ret), [old] "=&r" (oldval),
++		  [status] "=&r" (sc_status), [mem] "+A" (*(u64 __force *)addr)
++		: [value] "r" (value)
++		: "memory");
++
++	*old = oldval;
 +	*status = sc_status;
 +	return ret;
 +}
@@ -316,6 +368,198 @@ index 000000000000..6cb8454024a1
 +	return 0;
 +}
 +
++static int guivp_pbmt_selftest_pma_lrsc(const struct guivp_pbmt_test_ctx *ctx)
++{
++	phys_addr_t phys = ctx->base + GUIVP_REGION_PMA_AMO_OFFSET + 0x40;
++	void __iomem *map;
++	void __iomem *addr;
++	u64 init_val;
++	u64 lr_old;
++	u64 sc_status;
++	u64 readback;
++	long ret;
++	long read_ret;
++	int attempt;
++
++	init_val = phys ^ 0x3141592653589793ULL;
++	readback = 0;
++	ret = -EAGAIN;
++
++	map = ioremap_prot(phys & PAGE_MASK, PAGE_SIZE, PAGE_KERNEL);
++	if (!map)
++		return -ENOMEM;
++
++	addr = (u8 __iomem *)map + offset_in_page(phys);
++	memcpy_toio(addr, &init_val, sizeof(init_val));
++	for (attempt = 0; attempt < 64; attempt++) {
++		ret = guivp_pbmt_lrsc_nofault(addr, init_val + 1, &lr_old, &sc_status);
++		if (ret || !sc_status)
++			break;
++	}
++	read_ret = guivp_pbmt_amo_or_nofault(addr, 0, &readback);
++	iounmap(map);
++
++	if (ret || read_ret || sc_status || lr_old != init_val || readback != init_val + 1) {
++		pr_err("%s: LRSC selftest PMA_AMO_LOGICAL phys=%pa unexpected ret=%ld read_ret=%ld sc_status=%llu attempts=%d lr_old=0x%016llx read=0x%016llx\n",
++		       GUIVP_PBMT_TEST_NAME, &phys, ret, read_ret, sc_status, attempt + 1,
++		       lr_old, readback);
++		return -EIO;
++	}
++
++	pr_info("%s: LRSC selftest PMA_AMO_LOGICAL phys=%pa ret=%ld read_ret=%ld sc_status=%llu attempts=%d lr_old=0x%016llx read=0x%016llx PASS\n",
++		GUIVP_PBMT_TEST_NAME, &phys, ret, read_ret, sc_status, attempt + 1,
++		lr_old, readback);
++	return 0;
++}
++
++enum guivp_lrsc_mutex_phase {
++	GUIVP_LRSC_MUTEX_IDLE = 0,
++	GUIVP_LRSC_MUTEX_RUN = 1,
++	GUIVP_LRSC_MUTEX_DONE = 2,
++	GUIVP_LRSC_MUTEX_STOP = 3,
++};
++
++struct guivp_lrsc_mutex_state {
++	void __iomem *addr;
++	struct completion ready;
++	atomic_t phase;
++	unsigned int b_accesses;
++	unsigned int b_errors;
++	long b_last_ret;
++	u64 b_last_old;
++};
++
++static int guivp_pbmt_lrsc_mutex_worker(void *arg)
++{
++	struct guivp_lrsc_mutex_state *state = arg;
++
++	complete(&state->ready);
++	while (!kthread_should_stop()) {
++		int phase = atomic_read(&state->phase);
++		u64 old = 0;
++		long ret;
++
++		if (phase == GUIVP_LRSC_MUTEX_IDLE) {
++			cpu_relax();
++			continue;
++		}
++		if (phase == GUIVP_LRSC_MUTEX_STOP)
++			break;
++		if (phase != GUIVP_LRSC_MUTEX_RUN) {
++			cpu_relax();
++			continue;
++		}
++
++		ret = guivp_pbmt_amo_or_nofault(state->addr, 0, &old);
++		state->b_last_ret = ret;
++		state->b_last_old = old;
++		if (ret)
++			state->b_errors++;
++		else
++			state->b_accesses++;
++		atomic_set(&state->phase, GUIVP_LRSC_MUTEX_DONE);
++	}
++
++	return 0;
++}
++
++static int guivp_pbmt_pick_other_cpu(void)
++{
++	int this_cpu = raw_smp_processor_id();
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		if (cpu != this_cpu)
++			return cpu;
++	}
++
++	return -EINVAL;
++}
++
++static int guivp_pbmt_selftest_pma_lrsc_mutex(const struct guivp_pbmt_test_ctx *ctx)
++{
++	phys_addr_t phys = ctx->base + GUIVP_REGION_PMA_AMO_OFFSET + 0x80;
++	struct guivp_lrsc_mutex_state state;
++	struct task_struct *worker;
++	void __iomem *map;
++	void __iomem *addr;
++	u64 init_val;
++	u64 lr_old;
++	u64 sc_status;
++	u64 next_val;
++	long ret;
++	unsigned int a_successes = 0;
++	unsigned int a_failures = 0;
++	int worker_cpu;
++	int attempt;
++
++	worker_cpu = guivp_pbmt_pick_other_cpu();
++	if (worker_cpu < 0) {
++		pr_info("%s: LRSC mutex selftest PMA_AMO_LOGICAL phys=%pa SKIP need at least two online CPUs\n",
++			GUIVP_PBMT_TEST_NAME, &phys);
++		return 0;
++	}
++
++	map = ioremap_prot(phys & PAGE_MASK, PAGE_SIZE, PAGE_KERNEL);
++	if (!map)
++		return -ENOMEM;
++
++	addr = (u8 __iomem *)map + offset_in_page(phys);
++	init_val = phys ^ 0x6c7273636d757478ULL;
++	next_val = init_val;
++	memcpy_toio(addr, &init_val, sizeof(init_val));
++
++	memset(&state, 0, sizeof(state));
++	state.addr = addr;
++	init_completion(&state.ready);
++	atomic_set(&state.phase, GUIVP_LRSC_MUTEX_IDLE);
++
++	worker = kthread_create(guivp_pbmt_lrsc_mutex_worker, &state,
++				"guivp_lrsc_mutex/%d", worker_cpu);
++	if (IS_ERR(worker)) {
++		iounmap(map);
++		return PTR_ERR(worker);
++	}
++
++	kthread_bind(worker, worker_cpu);
++	wake_up_process(worker);
++	wait_for_completion(&state.ready);
++
++	for (attempt = 0; attempt < GUIVP_LRSC_MUTEX_ATTEMPTS; attempt++) {
++		next_val++;
++		atomic_set(&state.phase, GUIVP_LRSC_MUTEX_RUN);
++		ret = guivp_pbmt_lrsc_hold_nofault(addr, next_val, &lr_old, &sc_status);
++		while (atomic_read(&state.phase) != GUIVP_LRSC_MUTEX_DONE)
++			cpu_relax();
++		atomic_set(&state.phase, GUIVP_LRSC_MUTEX_IDLE);
++
++		if (ret) {
++			a_failures++;
++			break;
++		}
++		if (sc_status)
++			a_failures++;
++		else
++			a_successes++;
++	}
++
++	atomic_set(&state.phase, GUIVP_LRSC_MUTEX_STOP);
++	kthread_stop(worker);
++	iounmap(map);
++
++	if (!a_successes || state.b_accesses != GUIVP_LRSC_MUTEX_ATTEMPTS || state.b_errors) {
++		pr_err("%s: LRSC mutex selftest PMA_AMO_LOGICAL phys=%pa unexpected a_success=%u a_fail=%u b_access=%u b_errors=%u b_ret=%ld b_old=0x%016llx\n",
++		       GUIVP_PBMT_TEST_NAME, &phys, a_successes, a_failures,
++		       state.b_accesses, state.b_errors, state.b_last_ret, state.b_last_old);
++		return -EIO;
++	}
++
++	pr_info("%s: LRSC mutex selftest PMA_AMO_LOGICAL phys=%pa attempts=%u a_success=%u a_fail=%u b_access=%u b_old=0x%016llx PASS\n",
++		GUIVP_PBMT_TEST_NAME, &phys, GUIVP_LRSC_MUTEX_ATTEMPTS,
++		a_successes, a_failures, state.b_accesses, state.b_last_old);
++	return 0;
++}
++
 +static int guivp_pbmt_selftest_pma_mag(const struct guivp_pbmt_test_ctx *ctx)
 +{
 +	phys_addr_t phys = ctx->base + GUIVP_REGION_PMA_MAG_OFFSET;
@@ -395,6 +639,14 @@ index 000000000000..6cb8454024a1
 +		return ret;
 +
 +	ret = guivp_pbmt_selftest_pma_amo(ctx);
++	if (ret)
++		return ret;
++
++	ret = guivp_pbmt_selftest_pma_lrsc(ctx);
++	if (ret)
++		return ret;
++
++	ret = guivp_pbmt_selftest_pma_lrsc_mutex(ctx);
 +	if (ret)
 +		return ret;
 +
@@ -527,5 +779,3 @@ index 000000000000..6cb8454024a1
 +
 +MODULE_DESCRIPTION("GUI-VP PBMT test misc device");
 +MODULE_LICENSE("GPL");
---
-2.43.0

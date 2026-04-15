@@ -358,6 +358,14 @@ private:
 				          << " amo_phase=" << (atomic_ext->phase == TlmAtomicPhase::Load ? "load" : "store")
 				          << " aq=" << atomic_ext->aq
 				          << " rl=" << atomic_ext->rl;
+			} else if (atomic_ext && atomic_ext->is_lr) {
+				std::cout << " lr=1"
+				          << " aq=" << atomic_ext->aq
+				          << " rl=" << atomic_ext->rl;
+			} else if (atomic_ext && atomic_ext->is_sc) {
+				std::cout << " sc=1"
+				          << " aq=" << atomic_ext->aq
+				          << " rl=" << atomic_ext->rl;
 			}
 			std::cout << std::endl;
 			m_debug_cpu_tx_count++;

@@ -47,7 +47,9 @@ AMO 设计应满足：
 - 对 cacheable coherent 地址，AMO 必须在 coherent domain 中取得正确权限。
 - 对 non-cacheable 或 IO 地址，必须按 PMA 决定允许、fault 或 no-snoop atomic。
 - `aq/rl` 只影响发射和完成顺序，不改变 AMO 的基本 transaction 类型。
-- LR/SC 不复用 AMO 规则；LR/SC 是 reservation 语义，单独建模。
+- LR/SC 不等同 AMO：LR/SC 是 reservation + conditional store 语义。但在
+  coherent cacheable 地址上，LR 和 AMO load half 一样需要取得 unique line，
+  让后续成功 SC 能在本地完成条件写。
 
 ## TLM 扩展建议
 
@@ -78,7 +80,12 @@ struct tlm_ext_atomic : tlm::tlm_extension<tlm_ext_atomic> {
 };
 ```
 
-第一阶段可以只实现 AMO 字段，LR/SC 字段留给后续 exclusive/reservation 设计。
+第一阶段同时使用 AMO 与 LR/SC 字段：
+
+- `is_amo + phase=Load/Store` 标记 AMO 的 read/write half。
+- `is_lr + phase=Load` 标记 LR，表示建立 reservation 的 load side。
+- `is_sc + phase=Store` 标记成功 SC 的 store side。失败 SC 不发下游写事务。
+- `aq/rl` 对 AMO、LR、SC 都保留，作为后续 ordering/drain 的输入。
 
 ## ACE 实现 AMO 的推荐路径
 
@@ -235,7 +242,12 @@ RISC-V AMO 的 `aq/rl` 是 ordering 语义，不是 atomic 操作本身。
 ### 阶段 3：LR/SC 分离建模
 
 - LR 建立 reservation，不直接等同 AMO。
-- SC 成功时需要取得 unique 权限并执行条件写。
+- 当前第一阶段保留 VP `bus_lock` 和 `lr_addr` 判断来决定 SC 是否成功。
+- LR 在 cacheable coherent 地址上按 AMO load half 的权限规则处理：
+  - hit unique：直接返回旧值并建立 reservation。
+  - hit shared：先 `CleanUnique`，再返回旧值。
+  - miss：发 `ReadUnique`，取得旧值和 unique 权限。
+- SC 成功时标记 `is_sc` 并执行条件写；失败 SC 不产生 memory write gp。
 - 如果后端支持 exclusive monitor，可映射到 ACE/CHI exclusive 机制。
 - 如果后端不支持，保留 VP reservation + bus_lock fallback。
 
@@ -245,6 +257,9 @@ RISC-V AMO 的 `aq/rl` 是 ordering 语义，不是 atomic 操作本身。
 - cacheable coherent AMO miss 时 trace 应出现 unique 获取动作。
 - cacheable coherent AMO hit unique 时不应额外发读 miss。
 - shared line 上 AMO 应先 upgrade 到 unique，再修改。
+- cacheable coherent LR miss 时 trace 应出现 `lr=1` 和 `ReadUnique`。
+- cacheable coherent LR shared hit 时应先 `CleanUnique`，不能重新发 `ReadUnique`。
+- 成功 SC 应出现 `sc=1` store half；失败 SC 不应产生下游写。
 - NC/IO 派生 no-snoop 时不得分配 L1 coherent line。
 - `aq/rl` trace 可见，后续 memory operation 不越过对应顺序点。
 - 外部 coherent requester 存在时，不能观察到 AMO read 和 write 中间状态。
@@ -350,6 +365,44 @@ make run_rv64_mc VP_ARGS="--tlm-global-quantum=1000000 --use-dbbcache --tun-devi
 ```text
 [MasterACE CacheAceMaster cpu-entry] WRITE addr=0xefffe000 ... amo=1 amo_op=or amo_phase=store aq=1 rl=1
 ```
+
+## Linux 原生 LR/SC 到 master-ACE 的验证方法
+
+LR/SC 使用同一页 `0xefffe000-0xefffefff`，但测试地址偏移 `+0x40`，避免复用
+AMO 自测已经带入 cache 的 line：
+
+```text
+PMA_AMO_LOGICAL LR/SC test address: 0xefffe040
+```
+
+Linux 驱动新增启动自测：
+
+```text
+memcpy_toio(init)
+lr.d.aqrl old, (addr)
+sc.d.aqrl status, init + 1, (addr)
+memcpy_fromio(readback)
+```
+
+判断条件：
+
+- `lr_ret == 0`
+- `sc_ret == 0`
+- `sc_status == 0`
+- `lr_old == init`
+- `readback == init + 1`
+
+关键 VP trace：
+
+```text
+[MasterACE CacheAceMaster cpu-entry] READ addr=0xefffe040 ... lr=1 aq=1 rl=1
+[MasterACE CacheAceMaster.m_ace_port] READ addr=0xefffe040 len=64 snoop=0x7 domain=1 barrier=0
+[MasterACE CacheAceMaster cpu-entry] WRITE addr=0xefffe040 ... sc=1 aq=1 rl=1
+```
+
+其中 `snoop=0x7` 是 ACE `AR::ReadUnique`。如果 LR 命中 shared line，则应观察到
+`snoop=0xb`，即 `AR::CleanUnique`。这与 AMO 的权限获取规则一致，但 LR/SC 的
+成功与失败仍由 VP reservation/bus_lock 逻辑决定。
 
 2026-04-14 VP 实测结果：
 

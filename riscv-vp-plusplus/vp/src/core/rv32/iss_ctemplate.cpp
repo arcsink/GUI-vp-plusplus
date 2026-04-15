@@ -1143,6 +1143,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<4, true>(addr);
+					mem->set_next_lr_sc(instr.aq(), instr.rl());
 					regs[instr.rd()] = mem->atomic_load_reserved_word(addr);
 					if (lr_sc_counter == 0) {
 						lr_sc_counter = 17;  // this instruction + 16 additional ones, (an over-approximation) to cover
@@ -1158,6 +1159,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<4, false>(addr);
 					uint32_t val = regs[instr.rs2()];
+					mem->set_next_lr_sc(instr.aq(), instr.rl());
 					const auto sc_ok = mem->atomic_store_conditional_word(addr, val);
 					// H Extension fdw: defer SC writeback until after the store path completes so traps do not
 					// transiently corrupt x0/rd state before trap-entry CSR code runs.

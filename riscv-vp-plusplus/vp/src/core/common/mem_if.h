@@ -125,6 +125,11 @@ struct data_memory_if_T {
 		set_next_amo_class(amo_class);
 	}
 
+	virtual void set_next_lr_sc(bool aq, bool rl) {
+		(void)aq;
+		(void)rl;
+	}
+
 	/* returns true if the bus is locked */
 	virtual bool is_bus_locked() = 0;
 	/*

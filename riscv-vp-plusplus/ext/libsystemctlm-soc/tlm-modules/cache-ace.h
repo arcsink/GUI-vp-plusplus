@@ -1206,13 +1206,13 @@ private:
 			return false;
 		}
 
-		bool is_amo_load(tlm::tlm_generic_payload& trans)
+		bool is_atomic_unique_load(tlm::tlm_generic_payload& trans)
 		{
 			tlm_ext_atomic *atomic_ext;
 
 			trans.get_extension(atomic_ext);
 			return atomic_ext &&
-			       atomic_ext->is_amo &&
+			       (atomic_ext->is_amo || atomic_ext->is_lr) &&
 			       atomic_ext->phase == TlmAtomicPhase::Load;
 		}
 
@@ -1381,7 +1381,7 @@ private:
 			unsigned int len = gp.get_data_length();
 			unsigned int pos = 0;
 			bool exclusive = this->is_exclusive(gp);
-			bool amo_load = this->is_amo_load(gp);
+			bool atomic_unique_load = this->is_atomic_unique_load(gp);
 			bool exclusive_failed = false;
 			bool is_secure = this->get_secure(gp);
 
@@ -1394,9 +1394,9 @@ private:
 				}
 
 				if (hit) {
-					if (amo_load && !this->is_unique(addr)) {
-						// AMO is a read-modify-write operation.  Upgrade a shared hit before
-						// returning the old value so the following store half owns the line.
+					if (atomic_unique_load && !this->is_unique(addr)) {
+						// AMO and LR are the read side of an atomic update sequence.  Upgrade a
+						// shared hit before returning the old value so the store side owns the line.
 						this->clean_unique(gp, addr);
 					}
 					unsigned int n = this->read_line(gp, pos);
@@ -1404,14 +1404,14 @@ private:
 					addr+=n;
 				} else {
 					bool do_read_shared =
-						!amo_load &&
+						!atomic_unique_load &&
 						(exclusive || this->get_toggle());
 
 					//
-					// AMO miss must fetch the old value and unique permission, so use
+					// AMO/LR miss must fetch the old value and unique permission, so use
 					// ReadUnique rather than the normal shared read policy.
 					//
-					if (amo_load) {
+					if (atomic_unique_load) {
 						this->read_unique(gp, addr);
 					} else if (do_read_shared) {
 						this->read_shared(gp, addr);

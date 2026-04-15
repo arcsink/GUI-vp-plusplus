@@ -57,6 +57,28 @@ class tlm_ext_atomic : public tlm::tlm_extension<tlm_ext_atomic> {
 		amo_class = new_class;
 	}
 
+	void set_lr(bool new_aq, bool new_rl) {
+		is_amo = false;
+		is_lr = true;
+		is_sc = false;
+		aq = new_aq;
+		rl = new_rl;
+		phase = TlmAtomicPhase::Load;
+		amo_op = TlmAmoOp::None;
+		amo_class = PmaAmoClass::AMOArithmetic;
+	}
+
+	void set_sc(bool new_aq, bool new_rl) {
+		is_amo = false;
+		is_lr = false;
+		is_sc = true;
+		aq = new_aq;
+		rl = new_rl;
+		phase = TlmAtomicPhase::Store;
+		amo_op = TlmAmoOp::None;
+		amo_class = PmaAmoClass::AMOArithmetic;
+	}
+
 	tlm::tlm_extension_base *clone() const override {
 		return new tlm_ext_atomic(*this);
 	}

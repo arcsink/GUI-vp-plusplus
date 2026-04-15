@@ -57,6 +57,7 @@ add_test(NAME sw
 	WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../sw")
 
 add_subdirectory(tests/master_ace_amo)
+add_subdirectory(tests/lrsc_bus_lock)
 
 set_tests_properties(gdb integration sw PROPERTIES ENVIRONMENT
 	PATH=$ENV{PATH}:${CMAKE_RUNTIME_OUTPUT_DIRECTORY})

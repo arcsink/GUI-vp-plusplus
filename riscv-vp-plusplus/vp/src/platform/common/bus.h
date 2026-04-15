@@ -4,6 +4,7 @@
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/simple_target_socket.h>
 
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -159,11 +160,20 @@ class BusLock : public bus_lock_if {
 	bool locked = false;
 	unsigned owner = 0;
 	sc_core::sc_event lock_event;
+	bool trace_enabled = std::getenv("RVVP_BUS_LOCK_TRACE") != nullptr;
 
    public:
 	virtual void lock(unsigned hart_id) override {
 		if (locked && (hart_id != owner)) {
+			if (trace_enabled) {
+				std::cout << "[BusLock] hart=" << hart_id << " wait owner=" << owner
+				          << " time=" << sc_core::sc_time_stamp() << std::endl;
+			}
 			wait_until_unlocked();
+			if (trace_enabled) {
+				std::cout << "[BusLock] hart=" << hart_id << " resume time="
+				          << sc_core::sc_time_stamp() << std::endl;
+			}
 		}
 
 		assert(!locked || (hart_id == owner));

@@ -130,7 +130,7 @@ class AceAmoTestbench : public sc_module {
 		             true);
 	}
 
-	void send_read(uint64_t addr, bool amo, bool exclusive, uint8_t *data, unsigned len) {
+	void send_read(uint64_t addr, bool amo, bool lr, bool exclusive, uint8_t *data, unsigned len) {
 		tlm::tlm_generic_payload gp;
 		genattr_extension genattr;
 		tlm_ext_pbmt pbmt;
@@ -149,6 +149,11 @@ class AceAmoTestbench : public sc_module {
 			               true,
 			               true);
 			gp.set_extension(&atomic);
+		} else if (lr) {
+			// LR is also the read half of an atomic update sequence. It must
+			// acquire unique line ownership so a following successful SC can write.
+			atomic.set_lr(true, true);
+			gp.set_extension(&atomic);
 		}
 
 		gp.set_command(tlm::TLM_READ_COMMAND);
@@ -163,7 +168,7 @@ class AceAmoTestbench : public sc_module {
 		cpu_socket->b_transport(gp, delay);
 		gp.clear_extension(&genattr);
 		gp.clear_extension(&pbmt);
-		if (amo) {
+		if (amo || lr) {
 			gp.clear_extension(&atomic);
 		}
 
@@ -175,21 +180,38 @@ class AceAmoTestbench : public sc_module {
 		std::array<uint8_t, 8> data{};
 
 		memory.clear();
-		send_read(0x100, true, false, data.data(), data.size());
+		send_read(0x100, true, false, false, data.data(), data.size());
 		expect(memory.saw(AR::ReadUnique),
 		       "AMO load miss did not issue AR::ReadUnique");
 
 		memory.clear();
-		send_read(0x200, false, true, data.data(), data.size());
+		send_read(0x200, false, false, true, data.data(), data.size());
 		expect(memory.saw(AR::ReadShared),
 		       "setup read did not create a shared cache line");
 
 		memory.clear();
-		send_read(0x200, true, false, data.data(), data.size());
+		send_read(0x200, true, false, false, data.data(), data.size());
 		expect(memory.saw(AR::CleanUnique),
 		       "AMO load shared hit did not issue AR::CleanUnique");
 		expect(!memory.saw(AR::ReadUnique),
 		       "AMO load shared hit should upgrade with CleanUnique, not refetch with ReadUnique");
+
+		memory.clear();
+		send_read(0x300, false, true, false, data.data(), data.size());
+		expect(memory.saw(AR::ReadUnique),
+		       "LR miss did not issue AR::ReadUnique");
+
+		memory.clear();
+		send_read(0x400, false, false, true, data.data(), data.size());
+		expect(memory.saw(AR::ReadShared),
+		       "LR setup read did not create a shared cache line");
+
+		memory.clear();
+		send_read(0x400, false, true, false, data.data(), data.size());
+		expect(memory.saw(AR::CleanUnique),
+		       "LR shared hit did not issue AR::CleanUnique");
+		expect(!memory.saw(AR::ReadUnique),
+		       "LR shared hit should upgrade with CleanUnique, not refetch with ReadUnique");
 
 		std::cout << "master_ace_amo_test: PASS" << std::endl;
 		sc_stop();

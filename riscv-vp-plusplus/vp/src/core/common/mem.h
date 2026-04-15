@@ -65,6 +65,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 	TlmAmoOp next_amo_op = TlmAmoOp::None;
 	bool next_amo_aq = false;
 	bool next_amo_rl = false;
+	bool next_lr_sc_aq = false;
+	bool next_lr_sc_rl = false;
 
 	tlm_utils::simple_initiator_socket<CombinedMemoryInterface_T> isock;
 	tlm_utils::tlm_quantumkeeper &quantum_keeper;
@@ -173,6 +175,12 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 			// Keep AMO identity on both the read and write halves so master-ACE/cache-ACE can choose
 			// unique-line RMW handling instead of treating them as unrelated normal accesses.
 			atomic_ext->set_amo(atomic_phase, next_amo_op, amo_class, next_amo_aq, next_amo_rl);
+		} else if (atomic && lr_sc) {
+			if (cmd == tlm::TLM_READ_COMMAND) {
+				atomic_ext->set_lr(next_lr_sc_aq, next_lr_sc_rl);
+			} else if (cmd == tlm::TLM_WRITE_COMMAND) {
+				atomic_ext->set_sc(next_lr_sc_aq, next_lr_sc_rl);
+			}
 		}
 
 		/* ensure, that quantum_keeper value of ISS is up-to-date */
@@ -437,10 +445,14 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		if (bus_lock->is_locked(iss.get_hart_id())) {
 			if (addr == lr_addr) {
 				_store_data(addr, value, true, true, PmaAmoClass::AMOArithmetic, PmaReservability::RsrvNonEventual);
+				next_lr_sc_aq = false;
+				next_lr_sc_rl = false;
 				return true;
 			}
 			atomic_unlock();
 		}
+		next_lr_sc_aq = false;
+		next_lr_sc_rl = false;
 		return false;
 	}
 
@@ -560,6 +572,11 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		next_amo_op = amo_op;
 		next_amo_aq = aq;
 		next_amo_rl = rl;
+	}
+
+	void set_next_lr_sc(bool aq, bool rl) override {
+		next_lr_sc_aq = aq;
+		next_lr_sc_rl = rl;
 	}
 
 	void atomic_unlock() override {
