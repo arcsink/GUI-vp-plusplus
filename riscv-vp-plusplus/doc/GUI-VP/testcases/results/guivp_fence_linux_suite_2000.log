@@ -1,0 +1,10 @@
+[guivp-fence-suite] cpu_count=4 sb_iterations=2000
+[guivp-fence-suite] sb mode=no-fence iterations=2000 both_zero=0 elapsed_sec=8.779364
+[guivp-fence-suite] sb mode=fence-rw-rw iterations=2000 both_zero=0 elapsed_sec=8.405359
+[guivp-fence-suite] sb mode=fence-tso iterations=2000 both_zero=0 elapsed_sec=9.385280
+[guivp-fence-suite] fencei-local warm=1 no_fence_ret=1 with_fence_i_ret=2
+[guivp-fence-suite] fencei-remote label=no-remote-fence-i warmup=1 consumer_fence_i=0 result=1 expected=1
+[guivp-fence-suite] fencei-remote label=remote-fence-i-rw-rw-publish warmup=1 consumer_fence_i=1 result=3 expected=3
+[guivp-fence-suite] fencei-remote label=remote-fence-i-tso-publish warmup=1 consumer_fence_i=1 result=4 expected=4
+[guivp-fence-suite] summary sb_no_fence_both_zero=0 sb_fence_rwrw_both_zero=0 sb_fence_tso_both_zero=0 failures=0
+[guivp-fence-suite] RESULT=PASS note=sb-no-fence-did-not-hit-both-zero-in-this-run

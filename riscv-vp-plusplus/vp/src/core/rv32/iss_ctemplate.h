@@ -244,6 +244,7 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		stats.inc_amo();
 		uxlen_t addr = regs[instr.rs1()];
 		int32_t data;
+		lscache.fence();
 		try {
 			mem->set_next_amo(amo_class, amo_op, instr.aq(), instr.rl());
 			data = mem->atomic_load_word(addr);

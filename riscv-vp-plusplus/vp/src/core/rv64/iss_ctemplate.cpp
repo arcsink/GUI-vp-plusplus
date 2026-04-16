@@ -1187,11 +1187,12 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(FENCE) {
-					lscache.fence();
+					lscache.fence(instr.fence_pred(), instr.fence_succ(), instr.fence_fm());
 				}
 				OP_END();
 
 				OP_CASE(FENCE_I) {
+					lscache.fence();
 					dbbcache.fence_i(pc);
 					stats.inc_fence_i();
 				}
@@ -1480,6 +1481,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<4, true>(addr);
+					lscache.fence();
 					mem->set_next_lr_sc(instr.aq(), instr.rl());
 					regs[instr.rd()] = mem->atomic_load_reserved_word(addr);
 					if (lr_sc_counter == 0) {
@@ -1496,6 +1498,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<4, false>(addr);
 					int32_t val = regs[instr.rs2()];
+					lscache.fence();
 					mem->set_next_lr_sc(instr.aq(), instr.rl());
 					const auto sc_ok = mem->atomic_store_conditional_word(addr, val);
 					// H Extension fdw: defer SC writeback until after the store path completes so traps do not
@@ -1561,6 +1564,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<8, true>(addr);
+					lscache.fence();
 					mem->set_next_lr_sc(instr.aq(), instr.rl());
 					regs[instr.rd()] = mem->atomic_load_reserved_double(addr);
 					if (lr_sc_counter == 0) {
@@ -1577,6 +1581,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					uxlen_t addr = regs[instr.rs1()];
 					trap_check_addr_alignment<8, false>(addr);
 					uint64_t val = regs[instr.rs2()];
+					lscache.fence();
 					mem->set_next_lr_sc(instr.aq(), instr.rl());
 					const auto sc_ok = mem->atomic_store_conditional_double(addr, val);
 					// H Extension fdw: defer SC writeback until after the store path completes so traps do not
@@ -7269,6 +7274,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(SFENCE_VMA) {
 					if (s_mode() && csrs.mstatus.reg.fields.tvm)
 						RAISE_ILLEGAL_INSTRUCTION();
+					lscache.fence();
 					dbbcache.fence_vma(pc);
 					lscache.fence_vma();
 					stats.inc_fence_vma();

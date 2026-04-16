@@ -349,6 +349,11 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
 		mmu->flush_tlb();
 	}
 
+	pma_attributes get_pma_attributes_for_access(uint64_t addr, MemoryAccessType type) override {
+		uint64_t paddr = v2p(addr, type);
+		return pma.get_attributes(paddr);
+	}
+
 	uint32_t load_instr(uint64_t addr) override {
 		/*
 		 * We have support for RISC-V Compressed C instructions.

@@ -1073,7 +1073,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(FENCE) {
-					lscache.fence();
+					lscache.fence(instr.fence_pred(), instr.fence_succ(), instr.fence_fm());
 				}
 				OP_END();
 

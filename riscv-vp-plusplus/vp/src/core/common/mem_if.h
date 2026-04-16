@@ -142,6 +142,10 @@ struct data_memory_if_T {
 
 	virtual void flush_tlb() = 0;
 
+	virtual pma_attributes get_pma_attributes_for_access(uint64_t addr, MemoryAccessType type) {
+		assert(0);
+	}
+
 	/*
 	 * cheriv9 helper interfaces
 	 * TODO: needs major cleanup

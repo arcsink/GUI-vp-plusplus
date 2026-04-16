@@ -1,0 +1,4 @@
+[guivp-fence-sb] cpu_count=4 iterations=2000
+[guivp-fence-sb] mode=no-fence iterations=2000 both_zero=0 elapsed_sec=9.784484
+[guivp-fence-sb] mode=fence-rw-rw iterations=2000 both_zero=0 elapsed_sec=10.394945
+[guivp-fence-sb] RESULT=PASS note=no-fence-did-not-hit-both-zero-in-this-run

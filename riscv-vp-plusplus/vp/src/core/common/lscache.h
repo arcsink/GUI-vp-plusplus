@@ -15,8 +15,12 @@
 #ifndef RISCV_ISA_LSCACHE_H
 #define RISCV_ISA_LSCACHE_H
 
+#include <array>
 #include <climits>
 #include <cstdint>
+#include <cstring>
+#include <deque>
+#include <stdexcept>
 #include <string>
 
 #include "lscache_stats.h"
@@ -60,6 +64,11 @@ template <typename T_sxlen_t, typename T_uxlen_t>
 class LSCache_IF_T {
    protected:
 	using dmemif_t = data_memory_if_T<T_sxlen_t, T_uxlen_t>;
+	static constexpr uint32_t FENCE_SET_W = 0x1;
+	static constexpr uint32_t FENCE_SET_R = 0x2;
+	static constexpr uint32_t FENCE_SET_O = 0x4;
+	static constexpr uint32_t FENCE_SET_I = 0x8;
+	static constexpr uint32_t FENCE_FM_TSO = 0x8;
 	bool enabled;
 	uint64_t hartId = 0;
 	dmemif_t *data_mem = nullptr;
@@ -87,6 +96,12 @@ class LSCache_IF_T {
 
 	__always_inline void fence() {
 		// not using out of order execution/caches so can be ignored
+	}
+
+	__always_inline void fence(uint32_t pred, uint32_t succ, uint32_t fm) {
+		(void)pred;
+		(void)succ;
+		(void)fm;
 	}
 
 	__always_inline void fence_vma() {
@@ -177,6 +192,8 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 	friend lscachestats_t;
 
 	lscachestats_t stats = lscachestats_t(*this);
+	static constexpr size_t STORE_BUFFER_CAPACITY = 8;
+	static constexpr uint64_t STORE_BUFFER_RETIRE_LATENCY = 2;
 
 #define LSCACHE_SETS (1 << 8)
 #define LSCACHE_OFF(_virt_page_addr) ((_virt_page_addr) & 0x00FFF)
@@ -193,6 +210,16 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 	};
 	struct Entry cache[LSCACHE_SETS];
 
+	struct StoreBufferEntry {
+		uint64_t addr = 0;
+		std::array<uint8_t, sizeof(uint64_t)> bytes{};
+		uint8_t size = 0;
+		uint64_t ready_epoch = 0;
+	};
+
+	std::deque<StoreBufferEntry> store_buffer;
+	uint64_t store_buffer_epoch = 0;
+
 	inline void flush() {
 		memset(cache, 0, LSCACHE_SETS * sizeof(Entry));
 	}
@@ -202,6 +229,116 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 		uint64_t tag_valid = LSCACHE_TAG(virt_addr) | valid_bits;
 		cache[idx].tag_valid = tag_valid;
 		cache[idx].host_page_addr = host_page_addr;
+	}
+
+	inline bool is_main_memory_access(uint64_t addr, MemoryAccessType type) {
+		const auto attrs = this->data_mem->get_pma_attributes_for_access(addr, type);
+		return attrs.memory_type == PmaMemoryType::MainMemory;
+	}
+
+	inline bool entry_overlaps(const StoreBufferEntry &entry, uint64_t addr, uint8_t size) const {
+		const uint64_t entry_end = entry.addr + entry.size;
+		const uint64_t load_end = addr + size;
+		return !(entry_end <= addr || load_end <= entry.addr);
+	}
+
+	inline void commit_store_entry(const StoreBufferEntry &entry) {
+		switch (entry.size) {
+			case 1: {
+				this->data_mem->store_byte(entry.addr, entry.bytes[0]);
+				break;
+			}
+			case 2: {
+				uint16_t value;
+				memcpy(&value, entry.bytes.data(), sizeof(value));
+				this->data_mem->store_half(entry.addr, value);
+				break;
+			}
+			case 4: {
+				uint32_t value;
+				memcpy(&value, entry.bytes.data(), sizeof(value));
+				this->data_mem->store_word(entry.addr, value);
+				break;
+			}
+			case 8: {
+				uint64_t value;
+				memcpy(&value, entry.bytes.data(), sizeof(value));
+				this->data_mem->store_double(entry.addr, value);
+				break;
+			}
+			default:
+				throw std::runtime_error("LSCache store buffer encountered unsupported store width");
+		}
+	}
+
+	inline void retire_ready_store_buffer_entries() {
+		while (!store_buffer.empty() && store_buffer.front().ready_epoch <= store_buffer_epoch) {
+			commit_store_entry(store_buffer.front());
+			store_buffer.pop_front();
+		}
+	}
+
+	inline void advance_store_buffer_epoch() {
+		store_buffer_epoch++;
+		retire_ready_store_buffer_entries();
+	}
+
+	inline void drain_store_buffer() {
+		while (!store_buffer.empty()) {
+			commit_store_entry(store_buffer.front());
+			store_buffer.pop_front();
+		}
+	}
+
+	template <typename ARG_T>
+	inline void enqueue_store(uint64_t addr, ARG_T value) {
+		if (store_buffer.size() >= STORE_BUFFER_CAPACITY) {
+			commit_store_entry(store_buffer.front());
+			store_buffer.pop_front();
+		}
+
+		StoreBufferEntry entry;
+		entry.addr = addr;
+		entry.size = sizeof(ARG_T);
+		entry.ready_epoch = store_buffer_epoch + STORE_BUFFER_RETIRE_LATENCY;
+		memcpy(entry.bytes.data(), &value, sizeof(ARG_T));
+		store_buffer.push_back(entry);
+	}
+
+	inline bool has_store_buffer_overlap(uint64_t addr, uint8_t size) const {
+		for (const auto &entry : store_buffer) {
+			if (entry_overlaps(entry, addr, size)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	template <typename RET_T>
+	inline bool try_forward_from_store_buffer(uint64_t addr, RET_T &value) const {
+		std::array<uint8_t, sizeof(RET_T)> merged{};
+		std::array<bool, sizeof(RET_T)> valid{};
+
+		for (auto it = store_buffer.rbegin(); it != store_buffer.rend(); ++it) {
+			const auto &entry = *it;
+			for (uint8_t byte_idx = 0; byte_idx < sizeof(RET_T); ++byte_idx) {
+				const uint64_t cur_addr = addr + byte_idx;
+				if (cur_addr < entry.addr || cur_addr >= entry.addr + entry.size || valid[byte_idx]) {
+					continue;
+				}
+				merged[byte_idx] = entry.bytes[cur_addr - entry.addr];
+				valid[byte_idx] = true;
+			}
+		}
+
+		for (bool byte_valid : valid) {
+			if (!byte_valid) {
+				return false;
+			}
+		}
+
+		memcpy(&value, merged.data(), sizeof(RET_T));
+		return true;
 	}
 
 	__always_inline void *try_get_from_cache_load(uint64_t virt_addr) {
@@ -245,8 +382,22 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 	template <typename RET_T, typename CAST_T, Load_F<RET_T> load_f>
 	__always_inline RET_T load(uint64_t addr) {
 		stats.inc_loads();
+		advance_store_buffer_epoch();
+		if (has_store_buffer_overlap(addr, sizeof(CAST_T))) {
+			CAST_T forwarded;
+			if (try_forward_from_store_buffer<CAST_T>(addr, forwarded)) {
+				return forwarded;
+			}
+			drain_store_buffer();
+		}
+
+		if (unlikely(!is_main_memory_access(addr, LOAD))) {
+			drain_store_buffer();
+		}
+
 		if (unlikely(this->data_mem->is_bus_locked())) {
 			stats.inc_bus_locked();
+			drain_store_buffer();
 			return ((this->data_mem)->*(load_f))(addr);
 		}
 
@@ -264,7 +415,7 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 	using Store_F = void (dmemif_t::*)(uint64_t addr, ARG_T value);
 
 	template <typename ARG_T, Store_F<ARG_T> store_f>
-	__always_inline void store(uint64_t addr, ARG_T value) {
+	__always_inline void store_direct(uint64_t addr, ARG_T value) {
 		stats.inc_stores();
 		if (unlikely(this->data_mem->is_bus_locked())) {
 			stats.inc_bus_locked();
@@ -282,6 +433,25 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 		*haddr = value;
 	}
 
+	template <typename ARG_T, Store_F<ARG_T> store_f>
+	__always_inline void store(uint64_t addr, ARG_T value) {
+		advance_store_buffer_epoch();
+		if (unlikely(this->data_mem->is_bus_locked())) {
+			drain_store_buffer();
+			store_direct<ARG_T, store_f>(addr, value);
+			return;
+		}
+
+		if (!is_main_memory_access(addr, STORE)) {
+			drain_store_buffer();
+			store_direct<ARG_T, store_f>(addr, value);
+			return;
+		}
+
+		stats.inc_stores();
+		enqueue_store(addr, value);
+	}
+
    public:
 	LSCache_T() {
 		init(false, 0, nullptr);
@@ -296,7 +466,31 @@ class LSCache_T : public LSCache_IF_T<T_sxlen_t, T_uxlen_t> {
 		stats.print();
 	}
 
+	__always_inline void fence() {
+		drain_store_buffer();
+	}
+
+	__always_inline void fence(uint32_t pred, uint32_t succ, uint32_t fm) {
+		(void)succ;
+
+		// Current second-stage model only has one truly reorderable structure:
+		// the main-memory store buffer. Therefore only fences that constrain
+		// predecessor writes need to drain state here.
+		if (pred & super::FENCE_SET_W) {
+			drain_store_buffer();
+			return;
+		}
+
+		// FENCE.TSO is currently decoded as FENCE plus fm metadata. In a model
+		// without speculative load queues, the only meaningful local action is
+		// again draining older buffered stores.
+		if (fm == super::FENCE_FM_TSO && (pred & (super::FENCE_SET_R | super::FENCE_SET_W))) {
+			drain_store_buffer();
+		}
+	}
+
 	__always_inline void fence_vma() {
+		drain_store_buffer();
 		stats.inc_flushs();
 		flush();
 		super::fence_vma();
