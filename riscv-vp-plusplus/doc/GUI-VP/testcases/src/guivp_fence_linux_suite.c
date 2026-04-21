@@ -52,6 +52,32 @@ struct remote_i_shared {
     code_fn_t fn;
 };
 
+struct rwrw_mp_shared_state {
+    pthread_barrier_t iter_barrier;
+    volatile uint64_t payload __attribute__((aligned(64)));
+    volatile uint64_t flag __attribute__((aligned(64)));
+    volatile uint64_t observed __attribute__((aligned(64)));
+    long iterations;
+    int producer_cpu;
+    int consumer_cpu;
+    int producer_fence_rw_rw;
+    int consumer_fence_rw_rw;
+    uint64_t expected_payload;
+};
+
+struct rw_handoff_shared_state {
+    pthread_barrier_t iter_barrier;
+    volatile uint64_t payload __attribute__((aligned(64)));
+    volatile uint64_t flag __attribute__((aligned(64)));
+    volatile uint64_t ack __attribute__((aligned(64)));
+    volatile uint64_t observed __attribute__((aligned(64)));
+    long iterations;
+    int producer_cpu;
+    int consumer_cpu;
+    int observer_cpu;
+    uint64_t expected_payload;
+};
+
 static inline void compiler_barrier(void) {
     __asm__ volatile("" ::: "memory");
 }
@@ -181,6 +207,120 @@ static void *sb_worker_main(void *opaque) {
     return NULL;
 }
 
+static void *rwrw_mp_producer_main(void *opaque) {
+    struct rwrw_mp_shared_state *shared = (struct rwrw_mp_shared_state *)opaque;
+    long i;
+
+    try_pin_to_cpu(shared->producer_cpu);
+
+    for (i = 0; i < shared->iterations; ++i) {
+        pthread_barrier_wait(&shared->iter_barrier);
+
+        store_u64(&shared->payload, shared->expected_payload);
+        compiler_barrier();
+        if (shared->producer_fence_rw_rw) {
+            do_fence_rw_rw();
+        }
+        compiler_barrier();
+        store_u64(&shared->flag, 1);
+
+        pthread_barrier_wait(&shared->iter_barrier);
+    }
+
+    return NULL;
+}
+
+static void *rwrw_mp_consumer_main(void *opaque) {
+    struct rwrw_mp_shared_state *shared = (struct rwrw_mp_shared_state *)opaque;
+    long i;
+
+    try_pin_to_cpu(shared->consumer_cpu);
+
+    for (i = 0; i < shared->iterations; ++i) {
+        pthread_barrier_wait(&shared->iter_barrier);
+
+        while (load_u64(&shared->flag) == 0) {
+        }
+        compiler_barrier();
+        if (shared->consumer_fence_rw_rw) {
+            do_fence_rw_rw();
+        }
+        compiler_barrier();
+        shared->observed = load_u64(&shared->payload);
+
+        pthread_barrier_wait(&shared->iter_barrier);
+    }
+
+    return NULL;
+}
+
+static void *rw_handoff_producer_main(void *opaque) {
+    struct rw_handoff_shared_state *shared = (struct rw_handoff_shared_state *)opaque;
+    long i;
+
+    try_pin_to_cpu(shared->producer_cpu);
+
+    for (i = 0; i < shared->iterations; ++i) {
+        pthread_barrier_wait(&shared->iter_barrier);
+
+        store_u64(&shared->payload, shared->expected_payload);
+        compiler_barrier();
+        do_fence_rw_rw();
+        compiler_barrier();
+        store_u64(&shared->flag, 1);
+
+        pthread_barrier_wait(&shared->iter_barrier);
+    }
+
+    return NULL;
+}
+
+static void *rw_handoff_consumer_main(void *opaque) {
+    struct rw_handoff_shared_state *shared = (struct rw_handoff_shared_state *)opaque;
+    long i;
+
+    try_pin_to_cpu(shared->consumer_cpu);
+
+    for (i = 0; i < shared->iterations; ++i) {
+        pthread_barrier_wait(&shared->iter_barrier);
+
+        while (load_u64(&shared->flag) == 0) {
+        }
+        compiler_barrier();
+        /*
+         * English: Order the observed publish flag before the later ack store.
+         * 中文: 先把已经观察到的发布 flag 排在更晚的 ack store 之前。
+         */
+        do_fence_rw_rw();
+        compiler_barrier();
+        store_u64(&shared->ack, 1);
+
+        pthread_barrier_wait(&shared->iter_barrier);
+    }
+
+    return NULL;
+}
+
+static void *rw_handoff_observer_main(void *opaque) {
+    struct rw_handoff_shared_state *shared = (struct rw_handoff_shared_state *)opaque;
+    long i;
+
+    try_pin_to_cpu(shared->observer_cpu);
+
+    for (i = 0; i < shared->iterations; ++i) {
+        pthread_barrier_wait(&shared->iter_barrier);
+
+        while (load_u64(&shared->ack) == 0) {
+        }
+        compiler_barrier();
+        shared->observed = load_u64(&shared->payload);
+
+        pthread_barrier_wait(&shared->iter_barrier);
+    }
+
+    return NULL;
+}
+
 static long run_sb_mode(const char *label, int mode, long iterations, int cpu0, int cpu1) {
     struct sb_shared_state shared;
     struct sb_thread_ctx thread0_ctx;
@@ -247,6 +387,145 @@ static long run_sb_mode(const char *label, int mode, long iterations, int cpu0, 
            label, iterations, both_zero, end_ts - start_ts);
     fflush(stdout);
     return both_zero;
+}
+
+static int run_rwrw_mp_round(const char *label, long iterations, int producer_fence_rw_rw,
+                             int consumer_fence_rw_rw, uint64_t expected_payload) {
+    struct rwrw_mp_shared_state shared;
+    pthread_t producer_thread;
+    pthread_t consumer_thread;
+    long mismatches = 0;
+    long i;
+
+    memset(&shared, 0, sizeof(shared));
+    shared.iterations = iterations;
+    shared.producer_cpu = 0;
+    shared.consumer_cpu = 1;
+    shared.producer_fence_rw_rw = producer_fence_rw_rw;
+    shared.consumer_fence_rw_rw = consumer_fence_rw_rw;
+    shared.expected_payload = expected_payload;
+
+    if (pthread_barrier_init(&shared.iter_barrier, NULL, 3) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_barrier_init rwrw-mp failed\n");
+        return 1;
+    }
+
+    if (pthread_create(&producer_thread, NULL, rwrw_mp_producer_main, &shared) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_create rwrw-mp producer failed\n");
+        pthread_barrier_destroy(&shared.iter_barrier);
+        return 1;
+    }
+
+    if (pthread_create(&consumer_thread, NULL, rwrw_mp_consumer_main, &shared) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_create rwrw-mp consumer failed\n");
+        pthread_join(producer_thread, NULL);
+        pthread_barrier_destroy(&shared.iter_barrier);
+        return 1;
+    }
+
+    for (i = 0; i < iterations; ++i) {
+        shared.payload = 0;
+        shared.flag = 0;
+        shared.observed = 0;
+        compiler_barrier();
+
+        pthread_barrier_wait(&shared.iter_barrier);
+        pthread_barrier_wait(&shared.iter_barrier);
+
+        if (shared.observed != expected_payload) {
+            ++mismatches;
+        }
+    }
+
+    pthread_join(producer_thread, NULL);
+    pthread_join(consumer_thread, NULL);
+    pthread_barrier_destroy(&shared.iter_barrier);
+
+    printf("[guivp-fence-suite] rwrw-mp label=%s iterations=%ld producer_fence=%d consumer_fence=%d mismatches=%ld expected=%llu\n",
+           label, iterations, producer_fence_rw_rw, consumer_fence_rw_rw, mismatches,
+           (unsigned long long)expected_payload);
+    fflush(stdout);
+
+    if (mismatches != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: rwrw-mp %s mismatches=%ld\n", label, mismatches);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int run_rw_handoff_round(const char *label, long iterations, int cpu_count,
+                                uint64_t expected_payload) {
+    struct rw_handoff_shared_state shared;
+    pthread_t producer_thread;
+    pthread_t consumer_thread;
+    pthread_t observer_thread;
+    long mismatches = 0;
+    long i;
+
+    memset(&shared, 0, sizeof(shared));
+    shared.iterations = iterations;
+    shared.producer_cpu = 0;
+    shared.consumer_cpu = (cpu_count > 1) ? 1 : 0;
+    shared.observer_cpu = (cpu_count > 2) ? 2 : 0;
+    shared.expected_payload = expected_payload;
+
+    if (pthread_barrier_init(&shared.iter_barrier, NULL, 4) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_barrier_init rw-handoff failed\n");
+        return 1;
+    }
+
+    if (pthread_create(&producer_thread, NULL, rw_handoff_producer_main, &shared) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_create rw-handoff producer failed\n");
+        pthread_barrier_destroy(&shared.iter_barrier);
+        return 1;
+    }
+
+    if (pthread_create(&consumer_thread, NULL, rw_handoff_consumer_main, &shared) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_create rw-handoff consumer failed\n");
+        pthread_join(producer_thread, NULL);
+        pthread_barrier_destroy(&shared.iter_barrier);
+        return 1;
+    }
+
+    if (pthread_create(&observer_thread, NULL, rw_handoff_observer_main, &shared) != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: pthread_create rw-handoff observer failed\n");
+        pthread_join(producer_thread, NULL);
+        pthread_join(consumer_thread, NULL);
+        pthread_barrier_destroy(&shared.iter_barrier);
+        return 1;
+    }
+
+    for (i = 0; i < iterations; ++i) {
+        shared.payload = 0;
+        shared.flag = 0;
+        shared.ack = 0;
+        shared.observed = 0;
+        compiler_barrier();
+
+        pthread_barrier_wait(&shared.iter_barrier);
+        pthread_barrier_wait(&shared.iter_barrier);
+
+        if (shared.observed != expected_payload) {
+            ++mismatches;
+        }
+    }
+
+    pthread_join(producer_thread, NULL);
+    pthread_join(consumer_thread, NULL);
+    pthread_join(observer_thread, NULL);
+    pthread_barrier_destroy(&shared.iter_barrier);
+
+    printf("[guivp-fence-suite] rw-handoff label=%s iterations=%ld mismatches=%ld expected=%llu\n",
+           label, iterations, mismatches, (unsigned long long)expected_payload);
+    fflush(stdout);
+
+    if (mismatches != 0) {
+        fprintf(stderr, "[guivp-fence-suite] fail: rw-handoff %s mismatches=%ld\n", label, mismatches);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int run_local_fence_i_test(void) {
@@ -438,6 +717,9 @@ int main(int argc, char **argv) {
     }
 
     failures += run_local_fence_i_test();
+    failures += run_rwrw_mp_round("write-angle-publish", iterations, 1, 0, 0x11);
+    failures += run_rwrw_mp_round("read-angle-acquire", iterations, 1, 1, 0x22);
+    failures += run_rw_handoff_round("read-write-handoff", iterations, cpu_count, 0x33);
     failures += run_remote_fence_i_round("no-remote-fence-i", PUBLISH_FENCE_RW_RW, 0, 2, 1);
     failures += run_remote_fence_i_round("remote-fence-i-rw-rw-publish", PUBLISH_FENCE_RW_RW, 1, 3, 3);
     failures += run_remote_fence_i_round("remote-fence-i-tso-publish", PUBLISH_FENCE_TSO, 1, 4, 4);
