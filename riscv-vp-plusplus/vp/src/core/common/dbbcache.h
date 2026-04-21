@@ -67,6 +67,10 @@
 #define RISCV_ISA_DBBCACHE_H
 
 #include <climits>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -618,6 +622,14 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 	BlockLinkCache_T<TRAPLINKCACHE_SIZE> trapLinkCache;
 
 	uint32_t coherence_cnt = 0;
+	uint64_t fence_i_event_count = 0;
+	uint64_t fence_i_fast_path_count = 0;
+	size_t fence_i_sample_count = 0;
+	static constexpr size_t FENCE_I_SUMMARY_SAMPLE_LIMIT = 8;
+	std::array<T_uxlen_t, FENCE_I_SUMMARY_SAMPLE_LIMIT> fence_i_sample_pc{};
+	std::array<uint32_t, FENCE_I_SUMMARY_SAMPLE_LIMIT> fence_i_sample_before{};
+	std::array<uint32_t, FENCE_I_SUMMARY_SAMPLE_LIMIT> fence_i_sample_after{};
+	std::array<uint8_t, FENCE_I_SUMMARY_SAMPLE_LIMIT> fence_i_sample_fast_path{};
 
 	uint64_t cycle_counter_raw = 0;
 
@@ -869,6 +881,39 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 		}
 	}
 
+	__always_inline bool fence_i_trace_enabled() {
+		static int cached = -1;
+		if (unlikely(cached < 0)) {
+			const char *env = std::getenv("RVVP_FENCEI_TRACE");
+			cached = (env != nullptr && std::strcmp(env, "0") != 0) ? 1 : 0;
+		}
+		return cached != 0;
+	}
+
+	__always_inline bool fence_i_summary_enabled() {
+		static int cached = -1;
+		if (unlikely(cached < 0)) {
+			const char *env = std::getenv("RVVP_FENCEI_SUMMARY");
+			cached = (env != nullptr && std::strcmp(env, "0") != 0) ? 1 : 0;
+		}
+		return cached != 0;
+	}
+
+	__always_inline void record_fence_i_summary(T_uxlen_t pc, uint32_t coherence_before, uint32_t coherence_after,
+	                                            bool fast_path_before) {
+		fence_i_event_count++;
+		if (fast_path_before) {
+			fence_i_fast_path_count++;
+		}
+		if (fence_i_sample_count < FENCE_I_SUMMARY_SAMPLE_LIMIT) {
+			const size_t idx = fence_i_sample_count++;
+			fence_i_sample_pc[idx] = pc;
+			fence_i_sample_before[idx] = coherence_before;
+			fence_i_sample_after[idx] = coherence_after;
+			fence_i_sample_fast_path[idx] = fast_path_before ? 1 : 0;
+		}
+	}
+
 	__always_inline void fast_path_raw_disable() {
 		fastEntry = &fastDisableBlock.entries[0];
 	}
@@ -893,6 +938,9 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 		fastDisableBlock.init(0, *this);
 
 		coherence_cnt = 0;
+		fence_i_event_count = 0;
+		fence_i_fast_path_count = 0;
+		fence_i_sample_count = 0;
 
 		for (const auto &it : blockmap) {
 			delete it.second;
@@ -920,6 +968,20 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 
 	void print_stats() {
 		stats.print();
+		if (fence_i_summary_enabled() && fence_i_event_count != 0) {
+			// English: Emit one compact per-hart summary so Linux-side fence.i validation can be correlated without verbose trace logs.
+			// 中文: 输出每个 hart 的简洁摘要，便于和 Linux 侧 fence.i 验证对齐，而不必打开海量 trace。
+			std::fprintf(stderr,
+			             "[RVVP fence.i summary] hart=%lu events=%llu fast_path_before=%llu samples=%zu coherence_now=%u\n",
+			             (unsigned long)this->hartId, (unsigned long long)fence_i_event_count,
+			             (unsigned long long)fence_i_fast_path_count, fence_i_sample_count, coherence_cnt);
+			for (size_t i = 0; i < fence_i_sample_count; ++i) {
+				std::fprintf(stderr,
+				             "[RVVP fence.i summary] hart=%lu sample=%zu pc=0x%llx coherence_before=%u coherence_after=%u fast_path_before=%u\n",
+				             (unsigned long)this->hartId, i, (unsigned long long)fence_i_sample_pc[i],
+				             fence_i_sample_before[i], fence_i_sample_after[i], fence_i_sample_fast_path[i]);
+			}
+		}
 	}
 
 	__always_inline void branch_not_taken(T_uxlen_t pc) {
@@ -992,7 +1054,30 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 	}
 
 	__always_inline void fence_i(T_uxlen_t pc) {
+		const uint32_t coherence_before = coherence_cnt;
+		const bool fast_path_before = in_fast_path();
+		if (unlikely(fence_i_trace_enabled())) {
+			// English: Trace the local instruction-cache coherence counter so fence.i can be observed at VP level.
+			// 中文: 打印本地指令缓存一致性计数，便于在 VP 层直接观察 fence.i 的触发与更新。
+			std::fprintf(stderr,
+			             "[RVVP fence.i] hart=%lu pc=0x%llx coherence_before=%u fast_path=%d\n",
+			             (unsigned long)this->hartId, (unsigned long long)pc, coherence_before,
+			             fast_path_before ? 1 : 0);
+		}
+
 		coherence_update(pc);
+		if (unlikely(fence_i_summary_enabled())) {
+			record_fence_i_summary(pc, coherence_before, coherence_cnt, fast_path_before);
+		}
+
+		if (unlikely(fence_i_trace_enabled())) {
+			// English: Emit the post-update counter to prove that fence.i advanced DBBCache coherence state.
+			// 中文: 打印更新后的计数，证明 fence.i 已推进 DBBCache 的一致性状态。
+			std::fprintf(stderr,
+			             "[RVVP fence.i] hart=%lu pc=0x%llx coherence_after=%u fast_path=%d\n",
+			             (unsigned long)this->hartId, (unsigned long long)pc, coherence_cnt,
+			             in_fast_path() ? 1 : 0);
+		}
 	}
 
 	__always_inline void fence_vma(T_uxlen_t pc) {

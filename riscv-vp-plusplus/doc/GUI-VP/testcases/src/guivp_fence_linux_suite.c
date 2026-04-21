@@ -68,6 +68,22 @@ static inline void do_fence_tso(void) {
     __asm__ volatile(".4byte 0x8330000f" ::: "memory");
 }
 
+static inline void sync_generated_code_same_hart(void) {
+    /*
+     * English: The initial warm-up code bytes must be made visible to the same hart's later instruction fetch.
+     * 中文: 初始 warm-up 代码字节需要先对同一 hart 后续的取指可见。
+     */
+    do_fence_i();
+}
+
+static inline void sync_generated_code_cross_hart(void) {
+    /*
+     * English: Publish the initial code bytes so another hart can fetch the seeded function deterministically.
+     * 中文: 先把初始代码字节发布出去，确保另一 hart 能稳定取到预置函数。
+     */
+    do_fence_rw_rw();
+}
+
 static inline void store_u64(volatile uint64_t *ptr, uint64_t value) {
     __asm__ volatile("sd %1, 0(%0)" :: "r"(ptr), "r"(value) : "memory");
 }
@@ -247,6 +263,7 @@ static int run_local_fence_i_test(void) {
     }
 
     emit_return_imm(&fn, code, 1);
+    sync_generated_code_same_hart();
     for (i = 0; i < 16; ++i) {
         warmup_ret = fn();
         (void)warmup_ret;
@@ -327,6 +344,7 @@ static int run_remote_fence_i_round(const char *label, int publish_fence_kind, i
     shared.consumer_cpu = 1;
     shared.do_consumer_fence_i = consumer_fence_i;
     emit_return_imm(&fn, code, 1);
+    sync_generated_code_cross_hart();
     shared.fn = fn;
 
     if (pthread_barrier_init(&shared.ready_barrier, NULL, 2) != 0) {
